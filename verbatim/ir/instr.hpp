@@ -618,55 +618,61 @@ public:
 
 /* Memory */
 
-struct MemAccessBase {
+struct MemInfoBase {
+private:
 
-    Instr *ptr;
+    // ID of the pointer of origin. This ID should be consistent across accesses from the same pointer (or derived)
+    static constexpr unsigned PTR_ID_UNSET = ((1u << 30) - 1);
+    unsigned _ptr_id : 30 = PTR_ID_UNSET;
 
-    AliasMode::Enum alias_mode : 2;
+    AliasMode::Enum _alias_mode : 2;
 
     // For struct accesses, which struct and what offset the access is in
-    Size struct_offset;
-    ValueType struct_type = NULL;
+    Size _struct_offset;
+    ValueType _struct_type = NULL;
 
-    static void setup(MemAccessBase *base, Instr *ptr, AliasMode::Enum alias_mode)
+public:
+
+    AliasMode::Enum alias_mode()  { return _alias_mode; }
+
+    unsigned ptr_id()
     {
-        base->ptr         = ptr;
-        base->alias_mode  = alias_mode;
+        assert(_ptr_id != PTR_ID_UNSET);
+        return _ptr_id;
     }
 
-    static void set_struct(MemAccessBase *base, ValueType struct_type, Size struct_offset)
+    bool is_struct_access() { return _struct_type != ValueType(NULL); }
+    ValueType struct_type() { return _struct_type;   } // Returns NULL if no struct
+    Size    struct_offset() { return _struct_offset; }
+
+    void _setup(unsigned ptr_id, AliasMode::Enum alias_mode)
     {
-        base->struct_type   = struct_type;
-        base->struct_offset = struct_offset;
+        _ptr_id = ptr_id;
+        _alias_mode = alias_mode;
     }
 
 };
 
 
-struct LoadInstr : InstrBase<LoadInstr, InstrKind::LOAD> {
+struct LoadInstr : InstrBase<LoadInstr, InstrKind::LOAD>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     unsigned _is_volatile : 1;
 
 public:
 
-    Instr *ptr()                  { return _base.ptr;        }
-    AliasMode::Enum alias_mode()  { return _base.alias_mode; }
-
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
+    Instr *ptr()       { return _ptr;         }
     bool is_volatile() { return _is_volatile; }
 
     static LoadInstr *create(
         Primitive::Enum out_type,
-        Instr *ptr, AliasMode::Enum alias_mode, bool is_volatile
+        Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, bool is_volatile
     ) {
         LoadInstr *instr = construct(out_type);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->_ptr = ptr;
         instr->_is_volatile = is_volatile;
 
         if (is_volatile) instr->ref(instr);
@@ -676,7 +682,7 @@ public:
     }
 
     REPLACE_USES_IN_FN(
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup()
@@ -684,47 +690,36 @@ public:
         if (_is_volatile)
             return false;
 
-        unref(_base.ptr);
+        unref(_ptr);
         return true;
-    }
-
-
-    void set_struct(ValueType struct_type, Size struct_offset) {
-        MemAccessBase::set_struct(&_base, struct_type, struct_offset);
     }
 
 };
 
 
-struct StoreInstr : InstrBase<StoreInstr, InstrKind::STORE> {
+struct StoreInstr : InstrBase<StoreInstr, InstrKind::STORE>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     unsigned _is_volatile : 1;
     Instr *_value; // Value to store
 
 public:
 
-    Instr *ptr()                 { return _base.ptr;        }
-    AliasMode::Enum alias_mode() { return _base.alias_mode; }
-
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
+    Instr *ptr()       { return _ptr;         }
+    Instr *value()     { return _value;       }
     bool is_volatile() { return _is_volatile; }
 
-    Instr *value() { return _value; }
-
-    static StoreInstr *create(Instr *value, Instr *ptr, AliasMode::Enum alias_mode, bool is_volatile)
+    static StoreInstr *create(Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, bool is_volatile)
     {
         StoreInstr *instr = construct(Primitive::unset);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
-        instr->_is_volatile = is_volatile;
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->_ptr   = ptr;
         instr->_value = value;
+        instr->_is_volatile = is_volatile;
 
-        instr->ref(instr);
+        instr->ref(instr); // Stores have side effects, must persist even if not volatile
         instr->ref(value);
         instr->ref(ptr);
 
@@ -733,7 +728,7 @@ public:
 
     REPLACE_USES_IN_FN(
         REPLACE(_value);
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup()
@@ -742,13 +737,8 @@ public:
             return false;
 
         unref(_value);
-        unref(_base.ptr);
+        unref(_ptr);
         return true;
-    }
-
-
-    void set_struct(ValueType struct_type, Size struct_offset) {
-        MemAccessBase::set_struct(&_base, struct_type, struct_offset);
     }
 
 };
@@ -818,28 +808,22 @@ public:
 
 // Atomics should never be cleaned up
 
-struct AtomicLoadInstr : InstrBase<AtomicLoadInstr, InstrKind::ATOMIC_LOAD> {
+struct AtomicLoadInstr : InstrBase<AtomicLoadInstr, InstrKind::ATOMIC_LOAD>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     AtomicOrder::Enum _order;
 
 public:
 
-    Instr *ptr()                 { return _base.ptr;        }
-    AliasMode::Enum alias_mode() { return _base.alias_mode; }
-
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
+    Instr *ptr()              { return _ptr;   }
     AtomicOrder::Enum order() { return _order; }
 
-    static AtomicLoadInstr *create(Primitive::Enum out_type, Instr *ptr, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
+    static AtomicLoadInstr *create(Primitive::Enum out_type, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
     {
         AtomicLoadInstr *instr = construct(out_type);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
         instr->_order = order;
 
         instr->ref(instr);
@@ -849,7 +833,7 @@ public:
     }
 
     REPLACE_USES_IN_FN(
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup() {
@@ -859,30 +843,24 @@ public:
 };
 
 
-struct AtomicStoreInstr : InstrBase<AtomicStoreInstr, InstrKind::ATOMIC_STORE> {
+struct AtomicStoreInstr : InstrBase<AtomicStoreInstr, InstrKind::ATOMIC_STORE>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     Instr *_value;
     AtomicOrder::Enum _order;
 
 public:
 
-    Instr *ptr()                 { return _base.ptr;        }
-    AliasMode::Enum alias_mode() { return _base.alias_mode; }
-
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
+    Instr *ptr()              { return _ptr;   }
     Instr *value()            { return _value; }
     AtomicOrder::Enum order() { return _order; }
 
-    static AtomicStoreInstr *create(Instr *value, Instr *ptr, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
+    static AtomicStoreInstr *create(Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
     {
         AtomicStoreInstr *instr = construct(Primitive::unset);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
         instr->_order = order;
         instr->_value = value;
 
@@ -895,7 +873,7 @@ public:
 
     REPLACE_USES_IN_FN(
         REPLACE(_value);
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup() {
@@ -905,34 +883,29 @@ public:
 };
 
 
-struct AtomicOpInstr : InstrBase<AtomicOpInstr, InstrKind::ATOMIC_OP> {
+struct AtomicOpInstr : InstrBase<AtomicOpInstr, InstrKind::ATOMIC_OP>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     Instr *_value;
     AtomicOrder::Enum _order;
     AtomicOp::Enum    _op;
 
 public:
 
-    Instr *ptr()                 { return _base.ptr;        }
-    AliasMode::Enum alias_mode() { return _base.alias_mode; }
+    Instr *ptr()   { return _ptr;   }
+    Instr *value() { return _value; }
 
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
-    Instr *value()            { return _value; }
     AtomicOrder::Enum order() { return _order; }
     AtomicOp::Enum    op()    { return _op;    }
 
     static AtomicOpInstr *create(
         Primitive::Enum out_type,
-        Instr *value, Instr *ptr, AliasMode::Enum alias_mode, AtomicOrder::Enum order, AtomicOp::Enum op
+        Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order, AtomicOp::Enum op
     ) {
         AtomicOpInstr *instr = construct(out_type);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
         instr->_value = value;
         instr->_order = order;
         instr->_op    = op;
@@ -946,7 +919,7 @@ public:
 
     REPLACE_USES_IN_FN(
         REPLACE(_value);
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup() {
@@ -956,10 +929,10 @@ public:
 };
 
 
-struct AtomicCASInstr : InstrBase<AtomicCASInstr, InstrKind::ATOMIC_CAS> {
+struct AtomicCASInstr : InstrBase<AtomicCASInstr, InstrKind::ATOMIC_CAS>, MemInfoBase {
 private:
 
-    MemAccessBase _base;
+    Instr *_ptr;
     Instr *_value;
 
     AtomicOrder::Enum _fail_order;
@@ -967,22 +940,18 @@ private:
 
 public:
 
-    Instr *ptr()                 { return _base.ptr;        }
-    AliasMode::Enum alias_mode() { return _base.alias_mode; }
-
-    bool is_struct_access() { return _base.struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _base.struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _base.struct_offset; }
-
-    Instr *value()                    { return _value;         }
+    Instr *ptr()   { return _ptr;   }
+    Instr *value() { return _value; }
     AtomicOrder::Enum fail_order()    { return _fail_order;    }
     AtomicOrder::Enum success_order() { return _success_order; }
 
-    static AtomicCASInstr *create(Primitive::Enum out_type, Instr *value, Instr *ptr, AliasMode::Enum alias_mode, AtomicOrder::Enum fail_order, AtomicOrder::Enum success_order)
-    {
+    static AtomicCASInstr *create(
+        Primitive::Enum out_type,
+        Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum fail_order, AtomicOrder::Enum success_order
+    ) {
         AtomicCASInstr *instr = construct(out_type);
 
-        MemAccessBase::setup(&instr->_base, ptr, alias_mode);
+        instr->MemInfoBase::_setup(ptr_id, alias_mode);
         instr->_value = value;
         instr->_fail_order    = fail_order;
         instr->_success_order = success_order;
@@ -996,7 +965,7 @@ public:
 
     REPLACE_USES_IN_FN(
         REPLACE(_value);
-        REPLACE(_base.ptr);
+        REPLACE(_ptr);
     )
 
     bool cleanup() {

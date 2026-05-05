@@ -50,7 +50,7 @@ obj::Array<Section *> Function::compute_reverse_order(Section *entry)
 
 void Function::build_dominance()
 {
-    Section *entry = _sections.bottom;
+    Section *entry = _sections.bottom();
 
     // 1. Compute reverse postorder
     obj::Array<Section *> reverse_order = compute_reverse_order(entry);

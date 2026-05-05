@@ -185,9 +185,9 @@ public:
     }
 
 
-    // Insert a new key through a known entry.
+    // Insert a new key through a known entry that was found using `lookup()`.
     // Returns the ValType of the entry; The ENTRY pointer cannot be relied on after insertion.
-    always_inline ValType &insert(Entry *entry, KeyType key)
+    ValType &insert(Entry *entry, KeyType key)
     {
         new (&entry->key) KeyType(key);
         
@@ -220,6 +220,8 @@ public:
     // Returns NULL if the key isn't present.
     ValType *get(KeyType key)
     {
+        if (!_entries) return NULL;
+
         Entry *empty;
         Entry *entry = lookup(key, empty);
         
