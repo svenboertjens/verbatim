@@ -79,6 +79,14 @@ public:
     void _globalunit_set_tuid(TUID tuid) { _tuid = tuid; }
     void _globalunit_set_visibility(Visibility::Enum vis) { _vis = vis; }
 
+
+    template<typename T>
+    T *cast()
+    {
+        assert(T::is_kind(_kind));
+        return (T *)this;
+    }
+
 };
 
 
@@ -103,6 +111,8 @@ struct SymbolBase : Symbol {
     static constexpr SymbolFns fns = SymbolFns{
         .destruct = destruct,
     };
+
+    static bool is_kind(SymbolKind::Enum kind) { return kind == Kind; }
 
 };
 
@@ -148,49 +158,67 @@ using SymbolMap = obj::StrMap<SymbolPtr>;
 
 struct Dominance {
     Section *dom = NULL;
-    ObjSize rdst;
+    ObjSize rdst; // Reverse distance, higher = closer to the entry
 };
 
 using DominanceMap = obj::PtrMap<Section *, Dominance>;
+
+using PtrIDMap = obj::PtrMap<Instr *, unsigned>;
 
 struct FnFlag : NoCreate {
 enum Enum {
     NOFLAGS = 0,
     FORCEINLINE  = 1 << 0,
-    INTERPOSABLE = 1 << 1,
-    PURE         = 1 << 2, // Set after analysis
+    NOINLINE     = 1 << 1,
+    INTERPOSABLE = 1 << 2,
+};
+};
+
+struct AccessState : NoCreate {
+enum Enum {
+    PURE, READS, READWRITE
 };
 };
 
 struct Function : SymbolBase<Function, SymbolKind::FUNCTION> {
 private:
 
-    obj::Array<ValueType> _params;
-
+    obj::Array<ValueType>  _params;
     obj::LinkList<Section> _sections;
+    PtrIDMap _ptr_id_map;
 
     // The functions called by this function
     obj::Array<obj::Str> _calls;
 
     int _flags; // FnFlag flags
+    AccessState::Enum _access_state = AccessState::READWRITE; // Default to the most conservative; only analysis may update this
 
-    // For virtual functions, the virtual address location
-    void *_virtual_addr = NULL;
 
     DominanceMap _dominance;
+    obj::Array<Section *> _postorder;
 
-
-    void order_visit(Section *s, obj::PtrMap<Section *, int> &visited, obj::Array<Section *> &out);
-    obj::Array<Section *> compute_reverse_order(Section *entry);
-    void build_dominance();
+    void order_visit(Section *sec, obj::PtrMap<Section *, int> &visited);
+    void build_postorder();
+    void build_dominance(); // This should always do `build_postorder()`, and is the proxy for whether `_postorder` itself exists
 
 public:
 
-    const obj::Array<ValueType>  &params()   { return _params;   }
-    const obj::Array<obj::Str>   &calls()    { return _calls;    }
-    const obj::LinkList<Section> &sections() { return _sections; } // Not const, must be modifiable
+    const obj::Array<ValueType> &params()  { return _params;     }
+    const obj::Array<obj::Str> &calls()    { return _calls;      }
+    const PtrIDMap &ptr_id_map()           { return _ptr_id_map; }
 
-    const DominanceMap &dominance() 
+    // Don't modify this array! It's not marked const because I'm not adding const to every damn function
+    obj::LinkList<Section> &sections() { return _sections; }
+
+    int flags() { return _flags; }
+
+    AccessState::Enum access_state() { return _access_state; }
+    void update_access_state(AccessState::Enum access_state) {
+        _access_state = access_state;
+    }
+
+
+    const DominanceMap &dominance()
     {
         // Lazy-build the dominance map
         if (_dominance.size() == 0)
@@ -198,11 +226,20 @@ public:
 
         return _dominance;
     }
+    const obj::Array<Section *> &postorder()
+    {
+        if (_dominance.size() == 0)
+            build_dominance();
 
-    bool is_virtual()    { return _virtual_addr != NULL; }
-    void *virtual_addr() { return _virtual_addr;         }
+        return _postorder;
+    }
+    void invalidate_dominance()
+    {
+        _dominance = DominanceMap();
+        _postorder = obj::Array<Section *>();
+    }
 
-    int flags() { return _flags; }
+
 
     // Automatically adds itself to the symbol map
     static Function *create(SymbolMap &map, obj::Str symbol, Visibility::Enum visibility, Linkage::Enum linkage, obj::Array<ValueType> &&params, int flags)

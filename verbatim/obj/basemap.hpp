@@ -10,9 +10,6 @@
 #include <cassert>
 #include <utility>
 
-#define MAP_LOAD_FACTOR 0.75
-#define MAP_MIN_CAP 4U
-
 namespace obj {
 
 /* Map base.
@@ -34,7 +31,10 @@ struct BaseMap {
 
 private:
 
-    ObjSize _cap = MAP_MIN_CAP;
+    static constexpr double LOAD_FACTOR = 0.75;
+    static constexpr ObjSize MIN_CAP = 4;
+
+    ObjSize _cap = MIN_CAP;
     ObjSize _size = 0;
     Entry *_entries = NULL;
 
@@ -107,7 +107,7 @@ public:
 
     BaseMap(ObjSize init_cap)
     {
-        _cap = tools::max(init_cap, MAP_MIN_CAP);
+        _cap = tools::max(init_cap, MIN_CAP);
         _cap = tools::round_pow2(_cap);
     }
 
@@ -140,7 +140,7 @@ public:
         _size = other._size;
         _entries = other._entries;
 
-        other._cap = MAP_MIN_CAP;
+        other._cap = MIN_CAP;
         other._size = 0;
         other._entries = NULL;
     }
@@ -192,7 +192,7 @@ public:
         new (&entry->key) KeyType(key);
         
         // Check if we need to resize
-        if (++_size >= _cap * MAP_LOAD_FACTOR)
+        if (++_size >= _cap * LOAD_FACTOR)
         {
             resize();
             entry = lookup(key); // Shouldn't return NULL
@@ -205,6 +205,17 @@ public:
 
     
     ValType &operator[](KeyType key)
+    {
+        Entry *empty;
+        Entry *entry = lookup(key, empty);
+
+        if (!entry)
+            return insert(empty, key);
+
+        return entry->val;
+    }
+
+    const ValType &operator[](KeyType key) const
     {
         Entry *empty;
         Entry *entry = lookup(key, empty);
@@ -259,7 +270,7 @@ public:
     {
         while (iter < _cap)
         {
-            Entry *entry = _entries[iter];
+            Entry *entry = &_entries[iter];
 
             if (!KeyType::MapKey::is_empty(entry->key) && !KeyType::MapKey::is_tomb(entry->key))
             {
@@ -278,5 +289,3 @@ public:
 
 }
 
-#undef MAP_LOAD_FACTOR
-#undef MAP_MIN_CAP

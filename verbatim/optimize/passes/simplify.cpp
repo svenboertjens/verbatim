@@ -21,8 +21,6 @@ using namespace ir;
     Deduplication
 \*******************/
 
-/* Basic */
-
 static bool cmp_int_op(IntInstr *a, IntInstr *b, Context &ctx)
 {
     (void)ctx;
@@ -104,7 +102,7 @@ static bool cmp_symcall(SymbolCallInstr *a, SymbolCallInstr *b, Context &ctx)
 
     return (
         a->symbol() == b->symbol() &&
-        (fn->flags() & FnFlag::PURE) // Function must be pure to be eligible for deduplication
+        (fn->access_state() != AccessState::READWRITE) // Function must be pure to be eligible for deduplication
     );
 }
 
@@ -153,12 +151,12 @@ static bool dedupe_instr(Instr *instr, Context &ctx)
                 if (!cur_on_intersect && !nxt_on_intersect)
                 {
                     // Move REPLACE_WITH to the intersect, neither are in that section
-                    intersect->top_instr()->place_below(replace_with);
+                    intersect->last_instr()->place_prev(replace_with);
                 }
                 else if (cur_on_intersect && nxt_on_intersect)
                 {
                     // Need to figure out which is earlier
-                    Instr *iter = intersect->bottom_instr();
+                    Instr *iter = intersect->first_instr();
                     while (iter)
                     {
                         if (iter == cur_use)
@@ -238,7 +236,7 @@ static bool simplify_int_constfold(IntInstr *instr, ImmediateInstr *left, Immedi
     else
         imm_instr = ImmediateInstr::create(instr->out_type(), result);
 
-    instr->place_above(imm_instr);
+    instr->place_next(imm_instr);
     instr->replace_uses_with(imm_instr);
 
     return true;
@@ -284,8 +282,8 @@ static bool simplify_int_mul_oneimm(IntInstr *instr, Instr *left, Int immval)
         left, imm_instr, IntOp::SHL, IntOp::NOFLAGS
     );
 
-    instr->place_above(imm_instr);
-    imm_instr->place_above(shift_instr);
+    instr->place_next(imm_instr);
+    imm_instr->place_next(shift_instr);
     
     Instr *result = shift_instr;
     if (pow2_plus1 || pow2_minus1)
@@ -296,7 +294,7 @@ static bool simplify_int_mul_oneimm(IntInstr *instr, Instr *left, Int immval)
             shift_instr, left, pow2_plus1 ? IntOp::ADD : IntOp::SUB, IntOp::NOFLAGS
         );
 
-        shift_instr->place_above(correction_instr);
+        shift_instr->place_next(correction_instr);
         result = correction_instr;
     }
 
@@ -323,11 +321,11 @@ static bool simplify_int_div_oneimm(IntInstr *instr, Instr *left, Int immval)
         {
             // nbits(Int) - 1
             ImmediateInstr *shift_imm = ImmediateInstr::create(Primitive::i32, sizeof(Int) * 8 - 1);
-            instr->place_above(shift_imm);
+            instr->place_next(shift_imm);
 
             // imm - 1
             ImmediateInstr *mask_imm = ImmediateInstr::create(instr->out_type(), immval - 1);
-            shift_imm->place_above(mask_imm);
+            shift_imm->place_next(mask_imm);
 
 
             // x >> shift_imm
@@ -335,14 +333,14 @@ static bool simplify_int_div_oneimm(IntInstr *instr, Instr *left, Int immval)
                 instr->out_type(),
                 instr, shift_imm, IntOp::SHR, instr->flags() & IntOp::SIGNED // Preserve signedness, SHR differs depending on it
             );
-            mask_imm->place_above(shifted_x);
+            mask_imm->place_next(shifted_x);
 
             // shifted_x & mask_imm
             IntInstr *masked_x = IntInstr::create(
                 instr->out_type(),
                 shifted_x, mask_imm, IntOp::AND, IntOp::NOFLAGS
             );
-            shifted_x->place_above(masked_x);
+            shifted_x->place_next(masked_x);
 
 
             // x + masked_x
@@ -350,7 +348,7 @@ static bool simplify_int_div_oneimm(IntInstr *instr, Instr *left, Int immval)
                 instr->out_type(),
                 left, masked_x, IntOp::ADD, IntOp::NOFLAGS
             );
-            masked_x->place_above(shiftable);
+            masked_x->place_next(shiftable);
         }
 
         // imm = shift_amount
@@ -361,8 +359,8 @@ static bool simplify_int_div_oneimm(IntInstr *instr, Instr *left, Int immval)
             shiftable, imm_instr, IntOp::SHR, instr->flags() & IntOp::SIGNED // Preserve signedness, SHR differs depending on it
         );
 
-        instr->place_above(imm_instr);
-        imm_instr->place_above(shift_instr);
+        instr->place_next(imm_instr);
+        imm_instr->place_next(shift_instr);
         instr->replace_uses_with(shift_instr);
 
         return true;
@@ -422,7 +420,7 @@ static bool simplify_int_oneimm(IntInstr *instr, Instr *left, Instr *right, bool
         {
             ImmediateInstr *all_ones_instr = ImmediateInstr::create(instr->out_type(), (Int)-1);
 
-            instr->place_above(all_ones_instr);
+            instr->place_next(all_ones_instr);
             instr->replace_uses_with(all_ones_instr);
 
             return true;
@@ -463,7 +461,7 @@ static bool simplify_int_op_t(IntInstr *instr, Instr *left, Instr *right)
     bool right_is_imm = right->kind() == InstrKind::IMMEDIATE;
 
     if (left_is_imm && right_is_imm)
-        return simplify_int_constfold<Int>(instr, (ImmediateInstr *)left, (ImmediateInstr *)right);
+        return simplify_int_constfold<Int>(instr, left->cast<ImmediateInstr>(), right->cast<ImmediateInstr>());
 
     else if (int_op_is_comparison[instr->op()])
         return simplify_int_comparison<Int>(instr, left, right);
@@ -524,7 +522,7 @@ static bool simplify_fp_constfold(FpInstr *instr, ImmediateInstr *left, Immediat
     else
         imm_instr = ImmediateInstr::create(instr->out_type(), result);
 
-    instr->place_above(imm_instr);
+    instr->place_next(imm_instr);
     instr->replace_uses_with(imm_instr);
 
     return true;
@@ -548,7 +546,7 @@ static bool simplify_fp_op_t(FpInstr *instr, Instr *left, Instr *right, Context 
     bool right_is_imm = right->kind() == InstrKind::IMMEDIATE;
 
     if (left_is_imm && right_is_imm)
-        return simplify_fp_constfold<Float>(instr, (ImmediateInstr *)left, (ImmediateInstr *)right);
+        return simplify_fp_constfold<Float>(instr, left->cast<ImmediateInstr>(), right->cast<ImmediateInstr>());
 
     else if (left_is_imm || right_is_imm)
         return simplify_fp_oneimm<Float>(instr, left, right, ctx);
@@ -601,9 +599,11 @@ static bool simplify_instr(Instr *instr, Context &ctx)
     Main Method
 \*****************/
 
-void deduplicate(Context &ctx)
+void simplify(Context &ctx)
 {
     const obj::LinkList<Section> &sections = ctx.fn->sections();
+
+    // TODO: switch to a worklist
 
     bool progressed;
     do {
@@ -613,7 +613,7 @@ void deduplicate(Context &ctx)
         while (sec)
         {
             // Per-instr
-            Instr *next = sec->bottom_instr();
+            Instr *next = sec->first_instr();
             while (next)
             {
                 Instr *instr = next;

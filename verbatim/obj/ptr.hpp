@@ -13,46 +13,48 @@ template<typename T>
 struct Ptr {
 private:
 
-    T *ptr;
+    T *_ptr;
 
     void alloc_ptr() {
-        ptr = (T *)objalloc::malloc(sizeof(T));
+        _ptr = (T *)objalloc::malloc(sizeof(T));
     }
 
 public:
 
+    T *ptr() { return _ptr; }
+
     Ptr()
     {
         alloc_ptr();
-        new (ptr) T();   
+        new (_ptr) T();   
     }
 
     ~Ptr()
     {
-        if (!ptr) return;
+        if (!_ptr) return;
 
-        ptr->~T();
-        objalloc::free(ptr, sizeof(T));
+        _ptr->~T();
+        objalloc::free(_ptr, sizeof(T));
     }
 
 
     Ptr(const T &val)
     {
         alloc_ptr();
-        new (ptr) T(val);
+        new (_ptr) T(val);
     }
 
     Ptr(T &&val)
     {
         alloc_ptr();
-        new (ptr) T(std::move(val));
+        new (_ptr) T(std::move(val));
     }
 
 
     Ptr(const Ptr &other)
     {
         alloc_ptr();
-        new (ptr) T(*other.ptr);
+        new (_ptr) T(*other._ptr);
     }
     Ptr &operator=(const Ptr &other) {
         return tools::assign_copy_method(this, other);
@@ -60,18 +62,18 @@ public:
 
     Ptr(Ptr &&other)
     {
-        ptr = other.ptr;
-        other.ptr = NULL;
+        _ptr = other._ptr;
+        other._ptr = NULL;
     }
     Ptr &operator=(Ptr &&other) {
         return tools::assign_move_method(this, other);
     }
 
 
-    T &operator*()  { return *ptr; }
-    T *operator->() { return ptr; }
-    const T &operator*()  const { return *ptr; }
-    const T *operator->() const { return ptr; }
+    T &operator*()  { return *_ptr; }
+    T *operator->() { return _ptr; }
+    const T &operator*()  const { return *_ptr; }
+    const T *operator->() const { return _ptr; }
 
 };
 

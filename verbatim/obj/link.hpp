@@ -119,8 +119,8 @@ public:
     }
 
 
-    Link *next() { return nxt; }
-    Link *prev() { return prv; }
+    Link *next() const { return nxt; }
+    Link *prev() const { return prv; }
 
 };
 

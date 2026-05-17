@@ -6,6 +6,10 @@ namespace ir {
 
 Section *Function::intersect(Section *sec1, Section *sec2)
 {
+    // This is a public function, may be called when dominance is unbuilt
+    if (_dominance.size() == 0)
+        build_dominance();
+
     Section *left = sec1;
     Section *right = sec2;
 
@@ -22,7 +26,7 @@ Section *Function::intersect(Section *sec1, Section *sec2)
 }
 
 
-void Function::order_visit(Section *sec, obj::PtrMap<Section *, int> &visited, obj::Array<Section *> &reverse_order)
+void Function::order_visit(Section *sec, obj::PtrMap<Section *, int> &visited)
 {
     if (visited.get(sec))
         return;
@@ -32,44 +36,39 @@ void Function::order_visit(Section *sec, obj::PtrMap<Section *, int> &visited, o
     obj::Array<Section *> succs = sec->succeeding_sections();
 
     for (ObjSize i = 0; i < succs.size(); i++)
-        order_visit(succs[i], visited, reverse_order);
+        order_visit(succs[i], visited);
 
-    ObjSize rdst = reverse_order.push(sec);
+    ObjSize rdst = _postorder.push(sec);
     _dominance[sec].rdst = rdst;
 }
 
-obj::Array<Section *> Function::compute_reverse_order(Section *entry)
+void Function::build_postorder()
 {
-    obj::Array<Section *> reverse_order;
+    Section *entry = _sections.bottom();
+
+    _postorder = obj::Array<Section *>();
     obj::PtrMap<Section *, int> visited;
 
-    order_visit(entry, visited, reverse_order);
-
-    return reverse_order;
+    order_visit(entry, visited);
 }
 
 void Function::build_dominance()
 {
+    build_postorder();
+
     Section *entry = _sections.bottom();
-
-    // 1. Compute reverse postorder
-    obj::Array<Section *> reverse_order = compute_reverse_order(entry);
-
-    // 2. Initialize: entry dominates itself, everything else undefined
     _dominance[entry].dom = entry;
-    // (all other idom[x] = NULL implicitly)
 
-    // 3. Iterate to fixed point in RPO order
     bool changed;
     do
     {
         changed = false;
 
-        // Iterate in reverse order to cancel out reversedness of the array.
-        // Don't iterate over the first section.
-        for (ObjSize i = reverse_order.size() - 1; i > 0; i--)
+        // Iterate backwards to go in RPO.
+        // Don't iterate over the entry section, we set it to itself already.
+        for (ObjSize i = _postorder.size() - 1; i > 0; i--)
         {
-            Section *sec = reverse_order[i - 1];
+            Section *sec = _postorder[i - 1];
             const obj::Array<Section *> &preds = sec->preceding_sections();
 
             // Pick first predecessor that's already been processed

@@ -12,6 +12,7 @@
 #include "obj/str.hpp"
 
 #include "types.hpp"
+#include "defs.hpp"
 
 #include <cstddef>
 #include <cassert>
@@ -49,8 +50,8 @@ struct SectionBase : NoCopyMove {
 private:
 
     struct {
-        Instr *bottom = NULL;
-        Instr *top    = NULL; // Top instr must be a terminator
+        Instr *first = NULL; // If the first instr is a JunctionInstr, it must remain so
+        Instr *last  = NULL; // Last instr must be a terminator
     } _instrs;
 
     // Sections that precede this one
@@ -58,15 +59,15 @@ private:
 
 public:
 
-    Instr *top_instr()    { return _instrs.top;    }
-    Instr *bottom_instr() { return _instrs.bottom; }
+    Instr *last_instr()  { return _instrs.last;  }
+    Instr *first_instr() { return _instrs.first; }
 
     void precedes(Section *section)  { _preceding.push(section);   }
     void unprecede(Section *section) { _preceding.remove(section); }
 
     // For use in Instr struct
-    void _instr_set_top(Instr *instr)    { _instrs.top    = instr; }
-    void _instr_set_bottom(Instr *instr) { _instrs.bottom = instr; }
+    void _instr_set_last(Instr *instr)  { _instrs.last  = instr; }
+    void _instr_set_first(Instr *instr) { _instrs.first = instr; }
 
 
     void append_instr(Instr *);
@@ -118,7 +119,7 @@ enum Enum {
     FNPARAMS,
     FNPARAM_OUT,
 };
-static constexpr Size MAX_VALUE = FNPARAM_OUT;
+static constexpr InstrKind::Enum MAX_VALUE = FNPARAM_OUT;
 };
 
 
@@ -140,22 +141,41 @@ private:
 
     Instr *_prev;
     Instr *_next;
-    Section *_section = NULL;
+    Section *_section;
 
     obj::Array<Instr *> _users;
 
-    InstrKind::Enum _kind;
+    InstrKind::Enum _kind     : 16;
     Primitive::Enum _out_type : 16;
+
+    // Pointers MUST have this ID set accurately
+    PtrID _ptr_id = PTR_ID_UNSET;
 
 public:
 
     InstrKind::Enum kind()     { return _kind;     }
     Primitive::Enum out_type() { return _out_type; }
-    Section *section()         { assert(_section); return _section; }
+    Section *section()         { return _section;  }
     Instr *next() { return _next; }
     Instr *prev() { return _prev; }
 
+    void set_ptr_id(PtrID ptr_id) { _ptr_id = ptr_id; }
+    PtrID ptr_id()
+    {
+        assert(_ptr_id != PTR_ID_UNSET);
+        return _ptr_id;
+    }
+
+
+    // Returns true if this is the first instruction of the section,
+    // or if the next instruction is a JunctionInstr (so the first instruction of the section).
+    bool is_first()
+    {
+        if (!_prev) return true;
+        return _prev->kind() == InstrKind::JUNCTION;
+    }
     
+
     void ref(Instr *to_ref) {
         to_ref->_users.push(this);
     }
@@ -173,6 +193,7 @@ public:
 
         return false;
     }
+
 
     obj::Array<Instr *> copy_users() {
         return _users;
@@ -222,8 +243,8 @@ public:
     }
 
 
-    // Place an instruction above this one
-    void place_above(Instr *instr)
+    // Place an instruction on this one's `next`
+    void place_next(Instr *instr)
     {
         instr->_section = _section;
 
@@ -231,13 +252,13 @@ public:
         instr->_next = _next;
 
         if (_next) _next->_prev = instr;
-        else _section->_instr_set_top(instr);
+        else _section->_instr_set_last(instr);
 
         _next = instr;
     }
 
-    // Place an instruction below this one
-    void place_below(Instr *instr)
+    // Place an instruction on this one's `prev
+    void place_prev(Instr *instr)
     {
         instr->_section = _section;
 
@@ -245,50 +266,64 @@ public:
         instr->_prev = _prev;
 
         if (_prev) _prev->_next = instr;
-        else _section->_instr_set_bottom(instr);
+        else _section->_instr_set_first(instr);
 
         _prev = instr;
     }
 
-
-    // Move an already-placed instruction above this one
-    void move_above(Instr *instr)
+    // Move an already-placed instruction to this one's next
+    void move_next(Instr *instr)
     {
-        instr->_unlink();
-        place_above(instr);
+        if (_next == instr)
+            return;
+
+        instr->pull();
+        place_next(instr);
     }
 
 
-    // Move an already-placed instruction below this one
-    void move_below(Instr *instr)
+    // Move an already-placed instruction to this one's prev
+    void move_prev(Instr *instr)
     {
-        instr->_unlink();
-        place_below(instr);
+        if (_prev == instr)
+            return;
+
+        instr->pull();
+        place_prev(instr);
+    }
+
+    // Pull an instruction from its section without popping it, so that it can be placed again later.
+    // For immediate move operations, use `move_*()` instead.
+    void pull()
+    {
+        if (_next) _next->_prev = _prev;
+        else _section->_instr_set_last(_prev);
+
+        if (_prev) _prev->_next = _next;
+        else _section->_instr_set_first(_next);
     }
 
 
     // For use in InstrBase.
     // Setup of the section must happen on placement of the instruction.
-    void _setup(InstrKind::Enum kind, Primitive::Enum out_type)
+    static void setup(Instr *instr, InstrKind::Enum kind, Primitive::Enum out_type)
     {
-        _kind     = kind;
-        _out_type = out_type;
-    }
-
-    // For use in InstrBase
-    void _unlink()
-    {
-        if (_next) _next->_prev = _prev;
-        else _section->_instr_set_top(_prev);
-
-        if (_prev) _prev->_next = _next;
-        else _section->_instr_set_bottom(_next);
+        instr->_kind     = kind;
+        instr->_out_type = out_type;
     }
 
     // For use in Section
     void _section_set_next(Instr *instr) { _next = instr; }
     void _section_set_prev(Instr *instr) { _prev = instr; }
     void _section_set_self(Section *section) { _section = section; }
+
+
+    template<typename T>
+    T *cast()
+    {
+        assert(T::is_kind(_kind));
+        return (T *)this;
+    }
 
 };
 
@@ -332,9 +367,11 @@ struct InstrBase : Instr {
     {
         Data *data = objalloc::malloc<Data>();
         new (data) Data();
-        data->Instr::_setup(Kind, out_type);
+        Instr::setup(data, Kind, out_type);
         return data;
     }
+
+    static bool is_kind(InstrKind::Enum kind) { return kind == Kind; }
 
 private:
 
@@ -346,7 +383,7 @@ private:
         if (!can_destroy)
             return;
 
-        data->_unlink();
+        data->pull();
         data->~Data();
         objalloc::free<Data>(data);
         return;
@@ -394,7 +431,7 @@ public:
     // For use in the OutInstr's parent
     static void _destroy(Data *instr)
     {
-        instr->_unlink();
+        instr->pull();
         instr->~Data();
         objalloc::free<Data>(instr);
     }
@@ -549,7 +586,7 @@ public:
 struct TransformInstr : InstrBase<TransformInstr, InstrKind::TRANSFORM> {
 private:
 
-    Instr *_in; // Value to transform. Transformation type depends on 
+    Instr *_in; // Value to transform. Transformation type depends on the in/out type, and for integer extension, on signedness
     bool _signed;
 
 public:
@@ -618,37 +655,40 @@ public:
 
 /* Memory */
 
+struct AccessData {
+    Instr *ptr;
+    Ssize offset;
+    bool aliases_all;   // Whether the access aliases everything instead of just its own type
+    bool ptr_exclusive; // Pointer-exclusive aliasing, only aliases with pointers that have the same PTR_ID
+    bool struct_access; // Whether this is a struct access
+};
+
 struct MemInfoBase {
 private:
 
-    // ID of the pointer of origin. This ID should be consistent across accesses from the same pointer (or derived)
-    static constexpr unsigned PTR_ID_UNSET = ((1u << 30) - 1);
-    unsigned _ptr_id : 30 = PTR_ID_UNSET;
+    // Keep the access pointer outside of this struct, otherwise we complicate referencing it
 
-    AliasMode::Enum _alias_mode : 2;
+    Ssize _offset; // The offset of the access relative to the pointer
 
-    // For struct accesses, which struct and what offset the access is in
-    Size _struct_offset;
-    ValueType _struct_type = NULL;
+    bool _aliases_all;
+    bool _ptr_exclusive;
+    bool _struct_access;
 
 public:
 
-    AliasMode::Enum alias_mode()  { return _alias_mode; }
+    MemInfoBase *info_base() { return this;       }
 
-    unsigned ptr_id()
+    Ssize offset()       { return _offset;        }
+    bool aliases_all()   { return _aliases_all;   }
+    bool ptr_exclusive() { return _ptr_exclusive; }
+    bool struct_access() { return _struct_access; }
+
+    void _setup(const AccessData &info)
     {
-        assert(_ptr_id != PTR_ID_UNSET);
-        return _ptr_id;
-    }
-
-    bool is_struct_access() { return _struct_type != ValueType(NULL); }
-    ValueType struct_type() { return _struct_type;   } // Returns NULL if no struct
-    Size    struct_offset() { return _struct_offset; }
-
-    void _setup(unsigned ptr_id, AliasMode::Enum alias_mode)
-    {
-        _ptr_id = ptr_id;
-        _alias_mode = alias_mode;
+        _offset        = info.offset;
+        _aliases_all   = info.aliases_all;
+        _ptr_exclusive = info.ptr_exclusive;
+        _struct_access = info.struct_access;
     }
 
 };
@@ -665,18 +705,16 @@ public:
     Instr *ptr()       { return _ptr;         }
     bool is_volatile() { return _is_volatile; }
 
-    static LoadInstr *create(
-        Primitive::Enum out_type,
-        Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, bool is_volatile
-    ) {
+    static LoadInstr *create(Primitive::Enum out_type, const AccessData &data, bool is_volatile)
+    {
         LoadInstr *instr = construct(out_type);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
-        instr->_ptr = ptr;
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr = data.ptr;
         instr->_is_volatile = is_volatile;
 
         if (is_volatile) instr->ref(instr);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -710,18 +748,18 @@ public:
     Instr *value()     { return _value;       }
     bool is_volatile() { return _is_volatile; }
 
-    static StoreInstr *create(Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, bool is_volatile)
+    static StoreInstr *create(Instr *value, const AccessData &data, bool is_volatile)
     {
         StoreInstr *instr = construct(Primitive::unset);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
-        instr->_ptr   = ptr;
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr   = data.ptr;
         instr->_value = value;
         instr->_is_volatile = is_volatile;
 
         instr->ref(instr); // Stores have side effects, must persist even if not volatile
         instr->ref(value);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -808,6 +846,18 @@ public:
 
 // Atomics should never be cleaned up
 
+struct AtomicOrder : NoCreate {
+enum Enum {
+    RELAXED,
+    ACQUIRE,
+    RELEASE,
+    ACQREL,
+    SEQCST,
+};
+
+static constexpr unsigned MAX_VALUE = SEQCST;
+};
+
 struct AtomicLoadInstr : InstrBase<AtomicLoadInstr, InstrKind::ATOMIC_LOAD>, MemInfoBase {
 private:
 
@@ -819,15 +869,16 @@ public:
     Instr *ptr()              { return _ptr;   }
     AtomicOrder::Enum order() { return _order; }
 
-    static AtomicLoadInstr *create(Primitive::Enum out_type, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
+    static AtomicLoadInstr *create(Primitive::Enum out_type, const AccessData &data, AtomicOrder::Enum order)
     {
         AtomicLoadInstr *instr = construct(out_type);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr   = data.ptr;
         instr->_order = order;
 
         instr->ref(instr);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -856,17 +907,18 @@ public:
     Instr *value()            { return _value; }
     AtomicOrder::Enum order() { return _order; }
 
-    static AtomicStoreInstr *create(Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order)
+    static AtomicStoreInstr *create(Instr *value, const AccessData &data, AtomicOrder::Enum order)
     {
         AtomicStoreInstr *instr = construct(Primitive::unset);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr   = data.ptr;
         instr->_order = order;
         instr->_value = value;
 
         instr->ref(instr);
         instr->ref(value);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -899,20 +951,19 @@ public:
     AtomicOrder::Enum order() { return _order; }
     AtomicOp::Enum    op()    { return _op;    }
 
-    static AtomicOpInstr *create(
-        Primitive::Enum out_type,
-        Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum order, AtomicOp::Enum op
-    ) {
+    static AtomicOpInstr *create(Primitive::Enum out_type, Instr *value, const AccessData &data, AtomicOrder::Enum order, AtomicOp::Enum op)
+    {
         AtomicOpInstr *instr = construct(out_type);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr   = data.ptr;
         instr->_value = value;
         instr->_order = order;
         instr->_op    = op;
 
         instr->ref(instr);
         instr->ref(value);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -935,30 +986,27 @@ private:
     Instr *_ptr;
     Instr *_value;
 
-    AtomicOrder::Enum _fail_order;
-    AtomicOrder::Enum _success_order;
+    AtomicOrder::Enum _order;
 
 public:
 
     Instr *ptr()   { return _ptr;   }
     Instr *value() { return _value; }
-    AtomicOrder::Enum fail_order()    { return _fail_order;    }
-    AtomicOrder::Enum success_order() { return _success_order; }
 
-    static AtomicCASInstr *create(
-        Primitive::Enum out_type,
-        Instr *value, Instr *ptr, unsigned ptr_id, AliasMode::Enum alias_mode, AtomicOrder::Enum fail_order, AtomicOrder::Enum success_order
-    ) {
+    AtomicOrder::Enum order() { return _order; }
+
+    static AtomicCASInstr *create(Primitive::Enum out_type, Instr *value, const AccessData &data, AtomicOrder::Enum order)
+    {
         AtomicCASInstr *instr = construct(out_type);
 
-        instr->MemInfoBase::_setup(ptr_id, alias_mode);
+        instr->MemInfoBase::_setup(data);
+        instr->_ptr   = data.ptr;
         instr->_value = value;
-        instr->_fail_order    = fail_order;
-        instr->_success_order = success_order;
+        instr->_order = order;
 
         instr->ref(instr);
         instr->ref(value);
-        instr->ref(ptr);
+        instr->ref(data.ptr);
 
         return instr;
     }
@@ -1256,8 +1304,8 @@ private:
 
     obj::RawStr _text;
 
-    bool _touches_mem;
     bool _is_volatile;
+    bool _taints_memory; // For if memory is touched beyond strictly the input pointers
 
     // Goto assembly not supported, unknown if it will be later on
 
@@ -1265,20 +1313,20 @@ public:
 
     const obj::Array<AsmOperand>  &operands()  { return _operands;  }
     const obj::Array<obj::RawStr> &reg_clobs() { return _reg_clobs; }
-    const obj::RawStr &text() { return _text; }
-    bool touches_mem() { return _touches_mem; }
-    bool is_volatile() { return _is_volatile; }
+    const obj::RawStr &text() { return _text;     }
+    bool is_volatile()   { return _is_volatile;   }
+    bool taints_memory() { return _taints_memory; }
 
     // Sets the AsmOutInstrs' references and pointers
-    static AsmInstr *create(obj::Array<AsmOperand> &&operands, obj::Array<obj::RawStr> &&reg_clobs, obj::RawStr &&text, bool touches_mem, bool is_volatile)
+    static AsmInstr *create(obj::Array<AsmOperand> &&operands, obj::Array<obj::RawStr> &&reg_clobs, obj::RawStr &&text, bool is_volatile, bool taints_memory)
     {
         AsmInstr *instr = construct(Primitive::unset);
 
-        instr->_operands    = std::move(operands);
-        instr->_reg_clobs   = std::move(reg_clobs);
-        instr->_text        = std::move(text);
-        instr->_touches_mem = touches_mem;
-        instr->_is_volatile = is_volatile;
+        instr->_operands  = std::move(operands);
+        instr->_reg_clobs = std::move(reg_clobs);
+        instr->_text      = std::move(text);
+        instr->_is_volatile   = is_volatile;
+        instr->_taints_memory = taints_memory;
 
         for (ObjSize i = 0; i < instr->_operands.size(); i++)
         {
@@ -1412,17 +1460,17 @@ public:
 // We have to declare this one later because of dependence on the Instr struct
 inline void SectionBase::append_instr(Instr *instr)
 {
-    if (_instrs.top)
+    if (_instrs.last)
     {
-        _instrs.top->_section_set_next(instr);
-        instr->_section_set_prev(_instrs.top);
+        _instrs.last->_section_set_next(instr);
+        instr->_section_set_prev(_instrs.last);
         instr->_section_set_next(NULL);
-        _instrs.top = instr;
+        _instrs.last = instr;
     } 
     else
     {
         // First instruction we append
-        _instrs.top = _instrs.bottom = instr;
+        _instrs.last = _instrs.first = instr;
         instr->_section_set_next(NULL);
         instr->_section_set_prev(NULL);
     }
@@ -1434,7 +1482,7 @@ inline void SectionBase::append_instr(Instr *instr)
 inline obj::Array<Section *> SectionBase::succeeding_sections()
 {
     obj::Array<Section *> following;
-    Instr *term = _instrs.top;
+    Instr *term = _instrs.last;
 
     switch (term->kind())
     {

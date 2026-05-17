@@ -2,10 +2,8 @@
 
 #include "tools/structs.hpp"
 
-// Stuff related to operations (flags, available ops, etc.)
 
-
-/* INT/FP ops */
+/* INT/FP */
 
 struct IntOp : NoCreate {
 enum Enum {
@@ -54,17 +52,6 @@ static constexpr unsigned MAX_VALUE = GE;
 };
 
 
-/* Basic memory */
-
-struct AliasMode : NoCreate {
-enum Enum {
-    TYPE, // Aliases accesses of the same type
-    ALL,  // Aliases everything
-    EXCLUSIVE, // Exclusive alias space, only aliases with accesses of the same excl-space
-};
-};
-
-
 /* Atomics */
 
 struct AtomicOp : NoCreate {
@@ -80,17 +67,5 @@ enum Enum {
 };
 
 static constexpr unsigned MAX_VALUE = SWAP;
-};
-
-struct AtomicOrder : NoCreate {
-enum Enum {
-    RELAXED,
-    ACQUIRE,
-    RELEASE,
-    ACQREL,
-    SEQCST,
-};
-
-static constexpr unsigned MAX_VALUE = SEQCST;
 };
 
