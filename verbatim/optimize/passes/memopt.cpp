@@ -26,7 +26,7 @@ using SecAllowanceMap = obj::PtrMap<Section *, SecAllowance>;
 // Walk to the next memory access (or access-influencing instr), starting below LAST.
 // Also compares whether the next instruction is equal to CMP1 or CMP2.
 // Returns NULL when we can't walk further in this section.
-static always_inline Instr *walk_to_access(Instr *last, Instr *cmp1, Instr *cmp2, bool &matched_cmp)
+static always_inline Instr *walk_to_access(Instr *last, Instr *cmp1, Instr *cmp2, bool &matched_cmp, bool walk_to_next)
 {
     static const bool kind_is_access[InstrKind::MAX_VALUE] = {
         [0 ... InstrKind::MAX_VALUE - 1] = false,
@@ -51,7 +51,10 @@ static always_inline Instr *walk_to_access(Instr *last, Instr *cmp1, Instr *cmp2
     Instr *instr = last;
     while (!instr->is_first())
     {
-        instr = instr->prev();
+        if (walk_to_next)
+            instr = instr->next();
+        else
+            instr = instr->prev();
 
         if (instr == cmp1 || instr == cmp2)
         {
@@ -143,7 +146,26 @@ enum Enum {
 };
 };
 
-static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBase *main_mem, Instr *main_ptr, Instr *other, Context &ctx, bool consider_atomic_order)
+// How to consider aliasing with atomic ordering
+struct AtomicAliasing : NoCreate {
+enum Enum {
+    NONE, // ATOMIC_ORDER is never returned
+    UP,   // ATOMIC_ORDER is returned if ordering blocks moving through upwards
+    DOWN, // ATOMIC_ORDER is returned if ordering blocks moving through downwards
+};
+};
+
+static always_inline bool aliases_ordering(AtomicOrder::Enum order, AtomicAliasing::Enum atomic_aliasing)
+{
+    switch (atomic_aliasing)
+    {
+    case AtomicAliasing::NONE: return false;
+    case AtomicAliasing::UP:   return (order != AtomicOrder::RELAXED && order != AtomicOrder::RELEASE);
+    case AtomicAliasing::DOWN: return (order != AtomicOrder::RELAXED && order != AtomicOrder::ACQUIRE);
+    }
+}
+
+static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBase *main_mem, Instr *main_ptr, Instr *other, Context &ctx, AtomicAliasing::Enum atomic_aliasing)
 {
     // Variables for `aliases_access()`
     MemInfoBase *access_mem = NULL;
@@ -177,7 +199,7 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
         access_mem = load->info_base();
         access_ptr_id = load->ptr()->ptr_id();
 
-        if (load->order() != AtomicOrder::RELAXED && load->order() != AtomicOrder::RELEASE && consider_atomic_order)
+        if (aliases_ordering(load->order(), atomic_aliasing))
             return AliasesHow::ATOMIC_ORDER;
 
         if (load->ptr() == main_ptr)
@@ -216,7 +238,7 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
         access_mem = store->info_base();
         access_ptr_id = store->ptr()->ptr_id();
 
-        if (store->order() != AtomicOrder::RELAXED && store->order() != AtomicOrder::RELEASE && consider_atomic_order)
+        if (aliases_ordering(store->order(), atomic_aliasing))
             return AliasesHow::ATOMIC_ORDER;
 
         if (store->ptr() == main_ptr)
@@ -237,7 +259,7 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
         access_mem = op->info_base();
         access_ptr_id = op->ptr()->ptr_id();
 
-        if (op->order() != AtomicOrder::RELAXED && op->order() != AtomicOrder::RELEASE && consider_atomic_order)
+        if (aliases_ordering(op->order(), atomic_aliasing))
             return AliasesHow::ATOMIC_ORDER;
 
         if (
@@ -254,7 +276,7 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
         access_mem = cas->info_base();
         access_ptr_id = cas->ptr()->ptr_id();
 
-        if (cas->order() != AtomicOrder::RELAXED && cas->order() != AtomicOrder::RELEASE && consider_atomic_order)
+        if (aliases_ordering(cas->order(), atomic_aliasing))
             return AliasesHow::ATOMIC_ORDER;
 
         if (
@@ -269,8 +291,7 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
     {
         AtomicFenceInstr *fence = other->cast<AtomicFenceInstr>();
 
-        // Relaxed is not applicable for a fence, only need to check if the fence releases, all others block us
-        if (fence->order() != AtomicOrder::RELEASE && consider_atomic_order)
+        if (aliases_ordering(fence->order(), atomic_aliasing))
             return AliasesHow::ATOMIC_ORDER;
 
         return AliasesHow::NOT;
@@ -314,7 +335,7 @@ static void insert_into_allowance(Instr *ptr, Section *section, Ssize offset, Se
         ptralw.push(offset);
 }
 
-static bool section_allows_access(Instr *ptr, Section *section, Ssize offset, SecAllowanceMap &allowance)
+static bool section_allows_access(Instr *ptr, Ssize offset, Section *section, SecAllowanceMap &allowance)
 {
     SecAllowance &secalw = allowance[section];
     PtrAllowance *ptralw = secalw.get(ptr);
@@ -326,7 +347,9 @@ static bool section_allows_access(Instr *ptr, Section *section, Ssize offset, Se
 
 static void aaib_populate_secs(Section *sec, Section *finish, obj::PtrSet<Section *> &sections)
 {
-    sections.insert(sec);
+    // Early exit if we already inserted this one
+    if (!sections.insert(sec))
+        return;
 
     if (sec == finish)
         return;
@@ -352,7 +375,7 @@ static Instr *aliases_access_in_backedge(Instr *main_instr, MemInfoBase *main_me
     {
         Section *sec = key->ptr();
 
-        Instr *instr = sec->last_instr(); // Start is a terminator, so begin the loop with getting prev
+        Instr *instr = sec->last_instr(); // This grabs a terminator, so we grab its PREV at start of loop
         while (true)
         {
             if (instr->is_first())
@@ -360,7 +383,7 @@ static Instr *aliases_access_in_backedge(Instr *main_instr, MemInfoBase *main_me
 
             instr = instr->prev();
 
-            AliasesHow::Enum aliashow = access_aliases_how(main_instr, main_mem, main_ptr, instr, ctx, false);
+            AliasesHow::Enum aliashow = access_aliases_how(main_instr, main_mem, main_ptr, instr, ctx, AtomicAliasing::NONE);
 
             if (aliashow == AliasesHow::NOT)
                 continue;
@@ -380,14 +403,173 @@ static Instr *aliases_access_in_backedge(Instr *main_instr, MemInfoBase *main_me
 }
 
 
-// Returns the instruction we ended at.
-// Sets BLOCKED to true if there wasn't a boundary stopping us from continuing into a further section.
-static Instr *store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx, bool &blocked)
-{
-    blocked = true;
+struct CanHoistHow : NoCreate {
+enum Enum {
+    NOT,
+    CONTINUE_INTO_PRED,   // One predecessor present; can hoist into it
+    MULTI_SUCCESSOR_PRED, // One predecessor present with multiple successors to handle; unknown if we can continue
+    MULTI_PRED_HOIST,     // Multiple predecessors present; can hoist into all of them
+};
+};
 
+// RELEVANT_PREDS should have at least enough entries to fit all of CUR_SEC's predecessors.
+// RELEVANT_PREDS will hold the predecessors of CUR_SEC to hoist into.
+static always_inline CanHoistHow::Enum can_hoist_how(Instr *instr, Instr *ptr, MemInfoBase *mem, Ssize offset, Section **relevant_preds, Size &n_relevant_preds, Section *cur_sec, SecAllowanceMap &allowance, Context &ctx)
+{
+    const obj::Array<Section *> &preds = cur_sec->preceding_sections();
+
+    const DominanceMap &dominance = ctx.fn->dominance();
+    ObjSize cur_rdst = dominance[cur_sec].rdst;
+
+    // Guard for the entry section
+    if (preds.size() == 0)
+        return CanHoistHow::NOT;
+
+
+    n_relevant_preds = 0;
+
+    for (ObjSize i = 0; i < preds.size(); i++)
+    {
+        Section *pred = preds[i];
+        ObjSize pred_rdst = dominance[pred].rdst;
+
+        // Check if we dominate PRED
+        if (pred_rdst <= cur_rdst)
+        {
+            // Check if it's a back-edge from something irreducible to CUR_SEC
+            if (ctx.fn->intersect(cur_sec, pred) != cur_sec)
+                return CanHoistHow::NOT; // If so, be conservative and stop here
+
+            // Otherwise check if there's a store aliasing with ours.
+            // No need to check if it can be eliminated; if it can be, it should still be walked and eliminates us instead.
+            if (aliases_access_in_backedge(instr, mem, ptr, pred, cur_sec, ctx))
+                return CanHoistHow::NOT;
+        }
+        else {
+            // Not a back-edge, so we can hoist into it
+            relevant_preds[n_relevant_preds++] = pred;
+        }
+    }
+
+    if (n_relevant_preds == 1)
+    {
+        Section *pred = relevant_preds[0];
+        Instr *terminator = pred->last_instr();
+
+        // Check if it's a jump, or otherwise is already cleared for hoisting
+        if (terminator->kind() == InstrKind::JUMP || section_allows_access(ptr, offset, pred, allowance))
+            return CanHoistHow::CONTINUE_INTO_PRED;
+
+        // Otherwise it must be a branch or switch-case
+        assert(terminator->kind() == InstrKind::BRANCH || terminator->kind() == InstrKind::SWITCH);
+
+        return CanHoistHow::MULTI_SUCCESSOR_PRED;
+    }
+
+    // With more than 1 predecessor, all of them need to simply jump here.
+    // Don't check for allowance; code that passes that check shouldn't be created naturally even with labels
+    for (Size i = 0; i < n_relevant_preds; i++)
+    {
+        Section *pred = relevant_preds[i];
+        Instr *terminator = pred->last_instr();
+
+        if (terminator->kind() != InstrKind::JUMP)
+            return CanHoistHow::NOT;
+    }
+
+    return CanHoistHow::MULTI_PRED_HOIST;
+}
+
+
+static StoreInstr *duplicate_store(StoreInstr *orig)
+{
+    AccessData access_data = {
+        .ptr           = orig->ptr(),
+        .offset        = orig->offset(),
+        .aliases_all   = orig->aliases_all(),
+        .ptr_exclusive = orig->ptr_exclusive(),
+        .struct_access = orig->struct_access()
+    };
+
+    return StoreInstr::create(orig->value(), access_data, orig->is_volatile());
+}
+
+static LoadInstr *duplicate_load(LoadInstr *orig)
+{
+    AccessData access_data = {
+        .ptr           = orig->ptr(),
+        .offset        = orig->offset(),
+        .aliases_all   = orig->aliases_all(),
+        .ptr_exclusive = orig->ptr_exclusive(),
+        .struct_access = orig->struct_access()
+    };
+
+    return LoadInstr::create(orig->out_type(), access_data, orig->is_volatile());
+}
+
+static bool stores_equal(StoreInstr *a, StoreInstr *b)
+{
+    return (
+        a->ptr()           == b->ptr()           &&
+        a->offset()        == b->offset()        &&
+        a->aliases_all()   == b->aliases_all()   &&
+        a->ptr_exclusive() == b->ptr_exclusive() &&
+        a->struct_access() == b->struct_access() &&
+
+        a->value()         == b->value()         &&
+        a->is_volatile()   == b->is_volatile()
+    );
+}
+
+static bool loads_equal(LoadInstr *a, LoadInstr *b)
+{
+    return (
+        a->ptr()           == b->ptr()           &&
+        a->offset()        == b->offset()        &&
+        a->aliases_all()   == b->aliases_all()   &&
+        a->ptr_exclusive() == b->ptr_exclusive() &&
+        a->struct_access() == b->struct_access() &&
+
+        a->out_type()      == b->out_type()      &&
+        a->is_volatile()   == b->is_volatile()
+    );
+}
+
+
+// Returns the StoreInstr that matches, or NULL if we aliased the access or it wasn't present
+static StoreInstr *pred_successor_has_store(StoreInstr *instr, Section *succ, Context &ctx)
+{
+    Instr *access = succ->first_instr();
+
+    while (true)
+    {
+        bool matched_cmp;
+        access = walk_to_access(access, NULL, NULL, matched_cmp, true);
+
+        if (!access)
+            break;
+
+        if (access->kind() == InstrKind::STORE)
+        {
+            StoreInstr *store = access->cast<StoreInstr>();
+            if (stores_equal(instr, store))
+                return store;
+        }
+
+        if (access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::DOWN))
+            return NULL;
+
+        access = access->next();
+    }
+
+    return NULL;
+}
+
+// Expects an INSTR that we can freely place
+static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
+{
     /* Insert our instruction in the allowance map */
-    insert_into_allowance(instr->ptr(), instr->section(), instr->offset(), allowance);
+    insert_into_allowance(instr->ptr(), walk_start->section(), instr->offset(), allowance);
 
     /* Walk the instruction down the section */
 
@@ -395,16 +577,19 @@ static Instr *store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &
     while (true)
     {
         bool matched_cmp;
-        Instr *access = walk_to_access(last, instr->ptr(), instr->value(), matched_cmp);
+        Instr *access = walk_to_access(last, instr->ptr(), instr->value(), matched_cmp, false);
         if (!access) break;
 
         last = access;
 
         if (matched_cmp)
-            return access; // Can't walk further, we hit our ptr or value
+        {
+            access->place_next(instr);
+            return;
+        }
 
 
-        AliasesHow::Enum aliashow = access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, true);
+        AliasesHow::Enum aliashow = access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::UP);
 
         if (aliashow == AliasesHow::NOT)
             continue;
@@ -426,55 +611,84 @@ static Instr *store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &
             // Otherwise we can't progress further
         }
 
-        return access;
+        access->place_next(instr);
+        return;
     }
 
 
     /* Check how we can continue depending on predecessors */
 
     Section *cur_sec = walk_start->section();
-    const obj::Array<Section *> &preds = cur_sec->preceding_sections();
 
-    const DominanceMap &dominance = ctx.fn->dominance();
-    ObjSize cur_rdst = dominance[cur_sec].rdst;
+    Section *relevant_preds[cur_sec->preceding_sections().size()];
+    Size n_relevant_preds;
 
-    // Guard for the entry section
-    if (preds.size() == 0)
-        return last;
+    CanHoistHow::Enum hoisthow = can_hoist_how(instr, instr->ptr(), instr->info_base(), instr->offset(), relevant_preds, n_relevant_preds, cur_sec, allowance, ctx);
 
-
-    Section *intersect = cur_sec;
-    Section *cont_preds[preds.size()]; // Predecessors to continue with (back-edges are excluded from here)
-    Size n_cont_preds = 0;
-
-    for (ObjSize i = 0; i < preds.size(); i++)
+    switch (hoisthow)
     {
-        Section *pred = preds[i];
-        ObjSize pred_rdst = dominance[pred].rdst;
-
-        // Check if we dominate PRED
-        if (pred_rdst <= cur_rdst)
-        {
-            // Check if it's a back-edge from something irreducible to CUR_SEC
-            if (ctx.fn->intersect(cur_sec, pred) != cur_sec)
-                return last; // If so, be conservative and stop here
-
-            // Otherwise check if there's a store aliasing with ours.
-            // No need to check if it can be eliminated; if it can be, it should still be walked and eliminates us instead.
-            if (aliases_access_in_backedge(instr, instr->info_base(), instr->ptr(), pred, cur_sec, ctx))
-                return last;
-        }
-        else {
-            // Not a back-edge, so we can hoist into it
-            cont_preds[n_cont_preds++] = pred;
-        }
+    case CanHoistHow::NOT:
+    {
+        last->place_next(instr);
+        return;
     }
 
-    // LEFT OFF HERE
+    case CanHoistHow::CONTINUE_INTO_PRED:
+        return store_walk(instr, relevant_preds[0]->last_instr(), allowance, ctx);
+
+    case CanHoistHow::MULTI_PRED_HOIST:
+    {
+        // For all but the last, duplicate the store to give it a fresh one to place
+        for (Size i = 0; i < n_relevant_preds - 1; i++)
+        {
+            StoreInstr *duplicate = duplicate_store(instr);
+            store_walk(duplicate, relevant_preds[i]->last_instr(), allowance, ctx);
+        }
+
+        store_walk(instr, relevant_preds[n_relevant_preds - 1]->last_instr(), allowance, ctx);
+        return;
+    }
+
+    case CanHoistHow::MULTI_SUCCESSOR_PRED:
+    {
+        Section *pred = relevant_preds[0];
+        obj::Array<Section *> succs = pred->succeeding_sections();
+
+        // The stores to deduplicate
+        StoreInstr *stores[succs.size() - 1];
+
+        // Check if all predecessor's successors also do this exact store in a non-aliasing manner
+        ObjSize stores_iter = 0;
+        for (ObjSize i = 0; i < succs.size(); i++)
+        {
+            Section *succ = succs[i];
+            
+            if (succ == cur_sec)
+                continue;
+
+            StoreInstr *store = pred_successor_has_store(instr, succs[i], ctx);
+
+            if (!store)
+            {
+                last->place_next(instr);
+                return;
+            }
+
+            stores[stores_iter++] = store;
+        }
+
+        for (ObjSize i = 0; i < succs.size() - 1; i++)
+            stores[i]->pop();
+
+        store_walk(instr, cur_sec->last_instr(), allowance, ctx);
+        return;
+    }
+    }
 }
 
 
-static Instr *load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx, bool &blocked)
+// Expects an INSTR that we can freely place
+static void load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
 {
     // TODO
 }
@@ -493,29 +707,24 @@ void memopt(Context &ctx)
 
     for (ObjSize i = postorder.size(); i > 0; i--)
     {
-        Section *sec = postorder[i];
+        Section *sec = postorder[i - 1];
         Instr *instr = sec->first_instr();
 
         do {
-            if (instr->kind() == InstrKind::STORE || instr->kind() == InstrKind::STORE)
+            if (instr->kind() == InstrKind::STORE)
             {
-                bool blocked;
-                Instr *ends_at;
-
-                // NEXT must be valid as this isn't a terminator, and PREV isn't checked by the walks
-                Instr *start_at = instr->next();
-
-                // To not collide with ourselves during the walk
+                Instr *start_at = instr->next(); // Start at NEXT because START_AT itself isn't checked
                 instr->pull();
-
-                if (instr->kind() == InstrKind::STORE)
-                    ends_at = store_walk(instr->cast<StoreInstr>(), start_at, allowance, ctx, blocked);
-                else
-                    ends_at = load_walk(instr->cast<LoadInstr>(), start_at, allowance, ctx, blocked);
-                
-                ends_at->place_next(instr); // Place, not move, since we pulled the instr
+                store_walk(instr->cast<StoreInstr>(), start_at, allowance, ctx);
+            }
+            else if (instr->kind() == InstrKind::LOAD)
+            {
+                Instr *start_at = instr->next();
+                instr->pull();
+                load_walk(instr->cast<LoadInstr>(), start_at, allowance, ctx);
             }
             
+            instr = instr->next();
         } while (instr);
     }
 

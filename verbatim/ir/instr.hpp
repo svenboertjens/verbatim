@@ -37,15 +37,6 @@ using  Section = obj::Link<SectionBase>;
      Section
 \***************/
 
-struct SectionEnd : NoCreate {
-enum Enum {
-    JUMP,
-    BRANCH,
-    SWITCH,
-    RETURN,
-};
-};
-
 struct SectionBase : NoCopyMove {
 private:
 

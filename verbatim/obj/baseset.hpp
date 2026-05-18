@@ -173,13 +173,14 @@ public:
     }
 
 
-    void insert(KeyType key)
+    // Returns TRUE if it's a new insertion
+    bool insert(KeyType key)
     {
         KeyType *empty;
         KeyType *entry = lookup(key, empty);
 
         if (entry)
-            return;
+            return false;
 
         new (&entry->key) KeyType(key);
         
@@ -190,25 +191,8 @@ public:
             entry = lookup(key); // Shouldn't return NULL
             assert(entry != NULL);
         }
-    }
 
-
-    // Insert a new key through a known entry that was found using `lookup()`.
-    // Returns the ValType of the entry; The ENTRY pointer cannot be relied on after insertion.
-    KeyType &insert(KeyType *entry, KeyType key)
-    {
-        new (&entry->key) KeyType(key);
-        
-        // Check if we need to resize
-        if (++_size >= _cap * LOAD_FACTOR)
-        {
-            resize();
-            entry = lookup(key); // Shouldn't return NULL
-            assert(entry != NULL);
-        }
-
-        new (&entry->val) KeyType();
-        return entry->val;
+        return true;
     }
 
 
