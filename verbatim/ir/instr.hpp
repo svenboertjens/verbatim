@@ -116,6 +116,7 @@ static constexpr InstrKind::Enum MAX_VALUE = FNPARAM_OUT;
 
 struct InstrFns {
     // For destroying this instruction by dropping its references and freeing it.
+    // This function is responsible for pulling the instruction on destruction.
     // Instructions that must persist may do so instead.
     void (*destroy)(Instr *instr);
 
@@ -227,8 +228,9 @@ public:
         }
     }
 
-    // Pop an instr by clearing its references and destroying its link.
+    // Pop an instr by clearing its references and destroying it.
     // This doesn't actually pop instructions that must not be popped.
+    // Popping unplaced instructions is allowed.
     void pop() {
         instr_fns[_kind].destroy(this);
     }
@@ -287,11 +289,17 @@ public:
     // For immediate move operations, use `move_*()` instead.
     void pull()
     {
+        // Check if we're not placed yet
+        if (!_section)
+            return;
+
         if (_next) _next->_prev = _prev;
         else _section->_instr_set_last(_prev);
 
         if (_prev) _prev->_next = _next;
         else _section->_instr_set_first(_next);
+
+        _section = NULL;
     }
 
 

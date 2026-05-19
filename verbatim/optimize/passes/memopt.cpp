@@ -1,3 +1,5 @@
+#include "shared/types.hpp"
+
 #include "tools/structs.hpp"
 #include "tools/tools.hpp"
 
@@ -71,12 +73,17 @@ static always_inline Instr *walk_to_access(Instr *last, Instr *cmp1, Instr *cmp2
     return NULL;
 }
 
-static bool asm_touches_ptr(AsmInstr *assembly) {
-    return assembly->taints_memory();
+static bool offsets_overlap(Ssize off1, Ssize off2, Ssize size1, Ssize size2) {
+    return off1 < off2 + size2 && off2 < off1 + size1;
 }
 
-static bool offsets_overlap(Ssize off1, Ssize off2, Ssize tsize1, Ssize tsize2) {
-    return off1 < off2 + tsize2 && off2 < off1 + tsize1;
+// Check if INNER sits within OUTER
+static bool access_sits_within(Ssize outer_off, Ssize inner_off, Ssize outer_size, Ssize inner_size) {
+    return inner_off >= outer_off && inner_off + inner_size <= outer_off + outer_size;
+}
+
+static bool asm_touches_ptr(AsmInstr *assembly) {
+    return assembly->taints_memory();
 }
 
 // Does not check for full pointer equality, only type-based and rule-based
@@ -143,6 +150,7 @@ enum Enum {
 
     LOAD_OVERLAPS,
     STORE_OVERLAPS,
+    RMW_OVERLAPS, // From atomics who modify
 };
 };
 
@@ -183,7 +191,6 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
 
         if (load->ptr() == main_ptr)
         {
-            // Loads that overlap are a boundary
             if (offsets_overlap(load->offset(), main_mem->offset(), Primitive::sizes[load->out_type()], Primitive::sizes[main->out_type()]))
                 return AliasesHow::LOAD_OVERLAPS;
 
@@ -204,7 +211,6 @@ static always_inline AliasesHow::Enum access_aliases_how(Instr *main, MemInfoBas
 
         if (load->ptr() == main_ptr)
         {
-            // Loads that overlap are a boundary
             if (offsets_overlap(load->offset(), main_mem->offset(), Primitive::sizes[load->out_type()], Primitive::sizes[main->out_type()]))
                 return AliasesHow::LOAD_OVERLAPS;
 
@@ -556,7 +562,7 @@ static StoreInstr *pred_successor_has_store(StoreInstr *instr, Section *succ, Co
                 return store;
         }
 
-        if (access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::DOWN))
+        if (access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::UP) != AliasesHow::NOT)
             return NULL;
 
         access = access->next();
@@ -568,7 +574,7 @@ static StoreInstr *pred_successor_has_store(StoreInstr *instr, Section *succ, Co
 // Expects an INSTR that we can freely place
 static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
 {
-    /* Insert our instruction in the allowance map */
+    // Insert our instruction in the allowance map
     insert_into_allowance(instr->ptr(), walk_start->section(), instr->offset(), allowance);
 
     /* Walk the instruction down the section */
@@ -690,7 +696,185 @@ static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &al
 // Expects an INSTR that we can freely place
 static void load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
 {
-    // TODO
+    // Insert our instruction into the allowance map
+    insert_into_allowance(instr->ptr(), walk_start->section(), instr->offset(), allowance);
+
+    /* Walk the instruction down the section */
+
+    Instr *last = walk_start; // LAST must end on the instruction to place INSTR above if we reach after the walk loop
+    while (true)
+    {
+        bool matched_cmp;
+        Instr *access = walk_to_access(last, instr->ptr(), NULL, matched_cmp, false);
+        if (!access) break;
+
+        last = access;
+
+        if (matched_cmp)
+        {
+            access->place_next(instr);
+            return;
+        }
+
+
+        AliasesHow::Enum aliashow = access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::UP);
+
+        if (aliashow == AliasesHow::NOT)
+            continue;
+
+        if (aliashow == AliasesHow::LOAD_OVERLAPS)
+        {
+            // Only forward if both are either an integer or a float
+            if (Primitive::is_int(instr->out_type()) == Primitive::is_int(access->out_type()))
+                continue;
+
+            MemInfoBase *mem;
+            bool access_is_immutable;
+            if (access->kind() == InstrKind::LOAD)
+            {
+                LoadInstr *load = access->cast<LoadInstr>();
+                mem = load->info_base();
+                access_is_immutable = load->is_volatile();
+            }
+            else
+            {
+                mem = access->cast<AtomicLoadInstr>()->info_base();
+                access_is_immutable = true;
+            }
+
+            // No need to optimize loads at different offsets; a shift introduces more latency than just keeping the load
+            if (instr->offset() != mem->offset())
+                continue;
+
+            // If out types are equal, replacing is straightforward
+            if (instr->out_type() == access->out_type())
+            {
+                instr->replace_uses_with(access);
+                return;
+            }
+
+            // Check which to keep and which to replace depending on which is larger
+            Instr *keep, *replace;
+            if (Primitive::sizes[instr->out_type()] < Primitive::sizes[access->out_type()])
+            {
+                keep = access;
+                replace = instr;
+            }
+            else
+            {
+                // Can't replace the access if it's immutable 
+                if (access_is_immutable)
+                    continue;
+
+                keep = instr;
+                replace = access;
+            }
+
+            // Place INSTR so that both are in the right place, and we can use KEEP/REPLACE going further
+            access->place_next(instr);
+
+            // Signedness set to false but is irrelevant; this operation shrinks, no sign extension can occur
+            TransformInstr *transform = TransformInstr::create(replace->out_type(), keep, false);
+
+            keep->place_next(transform);
+            replace->replace_uses_with(keep);
+
+            return;
+        }
+
+        // TODO: allow store-to-load forwarding for atomic stores that returned ATOMIC_ORDER instead of STORE_OVERLAPS
+        if (aliashow == AliasesHow::STORE_OVERLAPS)
+        {
+            // Only forward if both are either an integer or a float
+            if (Primitive::is_int(instr->out_type()) == Primitive::is_int(access->out_type()))
+                continue;
+
+            MemInfoBase *mem;
+            Instr *store_value;
+            if (access->kind() == InstrKind::STORE)
+            {
+                StoreInstr *store = access->cast<StoreInstr>();
+                mem = store->info_base();
+                store_value = store->value();
+            }
+            else
+            {
+                AtomicStoreInstr *store = access->cast<AtomicStoreInstr>();
+                mem = store->info_base();
+                store_value = store->value();
+            }
+
+            // Check if our load fits within the store, rather than just overlapping
+            if (!access_sits_within(mem->offset(), instr->offset(), Primitive::sizes[access->out_type()], Primitive::sizes[instr->out_type()]))
+                continue;
+
+            Instr *forward_value = store_value;
+
+            // Check if we need to shift the store value.
+            // We can only do this for integers, not for floats.
+            if (instr->offset() != mem->offset())
+            {
+                if (Primitive::is_fp(instr->out_type()))
+                    continue;
+
+                u32 shift_value = (instr->offset() - mem->offset()) * 8;
+                ImmediateInstr *shift_imm = ImmediateInstr::create(Primitive::i32, shift_value);
+                IntInstr *shifted_value = IntInstr::create(access->out_type(), forward_value, shift_imm, IntOp::SHR, IntOp::NOFLAGS);
+
+                forward_value->place_next(shift_imm);
+                shift_imm->place_next(shifted_value);
+                forward_value = shifted_value;
+            }
+
+            // Check if we need to transform the value to a smaller size
+            if (instr->out_type() != access->out_type())
+            {
+                // Signedness set to false but irrelevant
+                TransformInstr *transformed = TransformInstr::create(instr->out_type(), forward_value, false);
+                
+                forward_value->place_next(transformed);
+                forward_value = transformed;
+            }
+
+            instr->replace_uses_with(forward_value);
+            return;
+        }
+
+        access->place_next(instr);
+        return;
+    }
+
+
+    /* Check how we can continue depending on predecessors */
+
+    Section *cur_sec = walk_start->section();
+
+    Section *relevant_preds[cur_sec->preceding_sections().size()];
+    Size n_relevant_preds;
+
+    CanHoistHow::Enum hoisthow = can_hoist_how(instr, instr->ptr(), instr->info_base(), instr->offset(), relevant_preds, n_relevant_preds, cur_sec, allowance, ctx);
+
+    switch (hoisthow)
+    {
+    case CanHoistHow::NOT:
+    {
+        last->place_next(instr);
+        return;
+    }
+
+    case CanHoistHow::CONTINUE_INTO_PRED:
+        return load_walk(instr, relevant_preds[0]->last_instr(), allowance, ctx);
+
+    case CanHoistHow::MULTI_PRED_HOIST:
+    {
+        // TODO
+    }
+
+    case CanHoistHow::MULTI_SUCCESSOR_PRED:
+    {
+        // TODO
+    }
+    }
 }
 
 
@@ -713,17 +897,28 @@ void memopt(Context &ctx)
         do {
             if (instr->kind() == InstrKind::STORE)
             {
+                StoreInstr *store = instr->cast<StoreInstr>();
+
+                if (store->is_volatile())
+                    goto next_iter;
+
                 Instr *start_at = instr->next(); // Start at NEXT because START_AT itself isn't checked
                 instr->pull();
-                store_walk(instr->cast<StoreInstr>(), start_at, allowance, ctx);
+                store_walk(store, start_at, allowance, ctx);
             }
             else if (instr->kind() == InstrKind::LOAD)
             {
+                LoadInstr *load = instr->cast<LoadInstr>();
+
+                if (load->is_volatile())
+                    goto next_iter;
+
                 Instr *start_at = instr->next();
                 instr->pull();
-                load_walk(instr->cast<LoadInstr>(), start_at, allowance, ctx);
+                load_walk(load, start_at, allowance, ctx);
             }
             
+            next_iter:
             instr = instr->next();
         } while (instr);
     }
