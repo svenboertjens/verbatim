@@ -17,6 +17,10 @@ namespace opt {
 using namespace ir;
 
 
+// TODO: Switch to worklist, with manual destruction of unused instructions
+// now that we no longer automatically do DCE through references.
+
+
 /*******************\
     Deduplication
 \*******************/
@@ -126,7 +130,7 @@ static bool (*cmp_instr_fns[InstrKind::MAX_VALUE + 1])(Instr *a, Instr *b, Conte
 static bool dedupe_instr(Instr *instr, Context &ctx)
 {
     bool deduped = false;
-    obj::Array<Instr *> users = instr->copy_users();
+    obj::Array<Instr *> users = instr->users();
 
     for (ObjSize i = 0; i < users.size(); i++)
     {
@@ -620,7 +624,7 @@ void simplify(Context &ctx)
                 next = next->next();
 
                 // Check if unused
-                if (instr->nusers() == 0)
+                if (instr->users().size() == 0)
                 {
                     instr->pop();
                     continue;

@@ -20,7 +20,9 @@
 #include <new>
 
 
-// TODO: Variadic function args
+// TODO: 
+// - Variadic function args
+// - Stack unwinding features
 
 
 /* Also contains `Section` */
@@ -120,9 +122,8 @@ struct InstrFns {
     // Instructions that must persist may do so instead.
     void (*destroy)(Instr *instr);
 
-    // For replacing uses within the struct.
-    // Should return true if TO_REPLACE was destroyed.
-    bool (*replace_uses_in)(Instr *replace_in, Instr *to_replace, Instr *replacement);
+    // For replacing uses within the instr.
+    void (*replace_uses_in)(Instr *replace_in, Instr *to_replace, Instr *replacement);
 };
 
 extern InstrFns instr_fns[];
@@ -172,60 +173,33 @@ public:
         to_ref->_users.push(this);
     }
 
-    // Pops/destroys the reference if empty, and returns true if so
-    bool unref(Instr *refd_instr)
-    {
+    void unref(Instr *refd_instr) {
         refd_instr->_users.remove(this);
-
-        if (refd_instr->_users.size() == 0)
-        {
-            refd_instr->pop();
-            return true;
-        }
-
-        return false;
     }
 
 
-    obj::Array<Instr *> copy_users() {
+    const obj::Array<Instr *> &users() {
         return _users;
-    }
-
-    ObjSize nusers() {
-        return _users.size();
     }
 
     
     // Replace all uses of TO_REPLACE by REPLACEMENT inside REPLACE_IN.
-    bool replace_uses_in(Instr *to_replace, Instr *replacement) {
-        return instr_fns[_kind].replace_uses_in(this, to_replace, replacement);
+    void replace_uses_in(Instr *to_replace, Instr *replacement) {
+        instr_fns[_kind].replace_uses_in(this, to_replace, replacement);
     }
 
     // Replace all uses of this instr by REPLACEMENT.
     // Automatically pops this instr.
-    // This may only be called on instructions that directly output a value.
+    // This should only be called on instructions that directly output a value.
     void replace_uses_with(Instr *replacement)
     {
         assert(_out_type != Primitive::unset);
 
-        if (_users.size() == 0)
-        {
-            this->pop();
-            return;
-        }
+        obj::Array<Instr *> users = this->users();
+        for (ObjSize i = 0; i < users.size(); i++)
+            users[i]->replace_uses_in(this, replacement);
 
-        // Keep iterating until this instr is destroyed.
-        // We can keep indexing at zero, to avoid relying on the moving `_users.size`.
-        // That index should be popped by `replace_uses_in()` every time.
-        Instr *prev_user = NULL;
-        while (true)
-        {
-            assert(_users[0] != prev_user);
-            prev_user = _users[0];
-
-            bool destroyed = _users[0]->replace_uses_in(this, replacement);
-            if (destroyed) return;
-        }
+        this->pop();
     }
 
     // Pop an instr by clearing its references and destroying it.
@@ -353,10 +327,23 @@ public:
  * This is to only have them be destroyed by an explicit pop.
  * This reference doesn't have to be cleared on cleanup.
  * 
- * Instructions with explicit OutInstrs for their output need special referencing/cleanup behavior.
- * The OutInstr must use the OutInstrBase base class. This class creates a `_destroy()` method for
- * unlinking and freeing the OutInstr. The parent Instr, on cleanup, is responsible for calling
- * that `_destroy()` method on its OutInstrs.
+ * # OutInstrs
+ * 
+ * Instructions with explicit OutInstrs for their output require special referencing/cleanup behavior.
+ * The OutInstr type must use the OutInstrBase base class. This class creates the `_set_parent()` and
+ * `_destroy()` methods, used for managing the OutInstr.
+ * 
+ * `_set_parent()` is used for setting/referencing the OutInstr's parent, and placing it below the
+ * parent in the IR. The OutInstr isn't destroyed when it has no references left. Rather, it unreferences
+ * its parent and persists. The parent instr is responsible for eventually destroying its OutInstrs through
+ * their `_destroy()` method, once all references have been dropped.
+ * 
+ * The referencing relationship is as follows: The parent instruction is referenced by its OutInstrs
+ * rather than by the consumers of the output values. The OutInstrs are each referenced by their own
+ * users. Once an OutInstr has no users, it unreferences its parent. The parent instr naturally becomes
+ * eligible for destruction once all its OutInstrs have unreferenced it.
+ * 
+ * It is not required for OutInstrs to stay strictly packed against their parent within the IR.
  * 
  */
 template<typename Data, InstrKind::Enum Kind>
@@ -385,11 +372,12 @@ private:
         data->pull();
         data->~Data();
         objalloc::free<Data>(data);
+
         return;
     }
 
-    static bool replace_uses_in(Instr *replace_in, Instr *to_replace, Instr *replacement) {
-        return ((Data *)replace_in)->replace_uses_in(to_replace, replacement);
+    static void replace_uses_in(Instr *replace_in, Instr *to_replace, Instr *replacement) {
+        ((Data *)replace_in)->replace_uses_in(to_replace, replacement);
     }
 
 public:
@@ -413,7 +401,7 @@ public:
     Instr *parent() { return _parent; }
 
     static Data *create(Primitive::Enum out_type) {
-        return InstrBase<Data, Kind>::construct(out_type);
+        return OutInstrBase::construct(out_type);
     }
 
     bool replace_uses_in(Instr *to_replace, Instr *replacement) {
@@ -435,10 +423,11 @@ public:
         objalloc::free<Data>(instr);
     }
 
-    void _set_parent(Instr *parent)
+    static void _set_parent(Data *instr, Instr *parent)
     {
-        _parent = parent;
-        ((Data *)this)->ref(parent);
+        ((OutInstrBase *)instr)->_parent = parent;
+        instr->ref(parent);
+        parent->place_next(instr);
     }
 
 };
@@ -471,23 +460,23 @@ static void replace_uses(obj::Array<Instr *>&arr, Instr *to_replace, Instr *repl
         replace_uses(arr[i], to_replace, replacement, replaced);
 }
 
-static bool replaced_fix_refs(Instr *self, Instr *to_replace, Instr *replacement, bool replaced)
+static void replaced_fix_refs(Instr *self, Instr *to_replace, Instr *replacement, bool replaced)
 {
     if (!replaced)
-        return false;
+        return;
 
     self->ref(replacement);
-    return self->unref(to_replace);
+    self->unref(to_replace);
 }
 
 #define REPLACE(var) replace_uses(var, to_replace, replacement, replaced)
 
 #define REPLACE_USES_IN_FN(code) \
-    bool replace_uses_in(Instr *to_replace, Instr *replacement) \
+    void replace_uses_in(Instr *to_replace, Instr *replacement) \
     { \
         bool replaced = false; \
         code \
-        return replaced_fix_refs(this, to_replace, replacement, replaced); \
+        replaced_fix_refs(this, to_replace, replacement, replaced); \
     }
 
 
@@ -1072,6 +1061,8 @@ public:
         instr->_in     = in;
         instr->_return_type = return_type;
 
+        array_add_refs(instr, in);
+
         return instr;
     }
 
@@ -1109,6 +1100,7 @@ public:
 
         instr->ref(instr); // Pointer calls have unknown side-effects, mustn't be removed
         instr->ref(ptr);
+        array_add_refs(instr, in);
 
         return instr;
     }
@@ -1160,6 +1152,21 @@ public:
         return false;
     }
 
+
+    // Add a junction value. Returns the index we placed at.
+    ObjSize add_value(Instr *val)
+    {
+        this->ref(val);
+        return _junction_vals.push(val);
+    }
+
+    // Remove the junction value at IDX
+    void remove_value(ObjSize idx)
+    {
+        this->unref(_junction_vals[idx]);
+        _junction_vals.pop(idx);
+    }
+
 };
 
 
@@ -1180,6 +1187,8 @@ public:
     static BranchInstr *create(Instr *cond, Section *then_case, Section *else_case)
     {
         BranchInstr *instr = construct(Primitive::unset);
+
+        assert(cond->out_type() == Primitive::i1);
 
         instr->_cond = cond;
         instr->_then_case = then_case;
@@ -1336,9 +1345,8 @@ public:
 
             if (operand.out)
             {
-                AsmOutInstr *asmout = (AsmOutInstr *)operand.out;
-                asmout->_set_parent(instr);
-                asmout->ref(instr);
+                AsmOutInstr *asmout = operand.out->cast<AsmOutInstr>();
+                AsmOutInstr::_set_parent(asmout, instr);
             }
         }
 
@@ -1397,9 +1405,8 @@ public:
 
         for (ObjSize i = 0; i < instr->_outs.size(); i++)
         {
-            JunctOutInstr *out = (JunctOutInstr *)instr->_outs[i];
-            out->_set_parent(instr);
-            out->ref(instr);
+            JunctOutInstr *out = instr->_outs[i]->cast<JunctOutInstr>();
+            JunctOutInstr::_set_parent(out, instr);
         }
 
         return instr;
@@ -1409,6 +1416,31 @@ public:
 
     bool cleanup() {
         return false;
+    }
+
+
+    // Add a junction output instruction.
+    // This function must be paired with adding an input instruction at every predecessor's jump.
+    JunctOutInstr *add_out(Primitive::Enum out_type)
+    {
+        JunctOutInstr *out = JunctOutInstr::create(out_type);
+        JunctOutInstr::_set_parent(out, this);
+        _outs.push(out);
+
+        return out;
+    }
+
+    // Remove a junction value from the JunctionInstr and predecessors' JumpInstrs
+    void remove_value(ObjSize idx)
+    {
+        _outs.pop(idx);
+
+        const obj::Array<Section *> &preds = this->section()->preceding_sections();
+        for (ObjSize i = 0; i < preds.size(); i++)
+        {
+            JumpInstr *jump = preds[i]->last_instr()->cast<JumpInstr>();
+            jump->remove_value(idx);
+        }
     }
 
 };
@@ -1435,9 +1467,8 @@ public:
 
         for (ObjSize i = 0; i < instr->_outs.size(); i++)
         {
-            FnParamOutInstr *out = (FnParamOutInstr *)instr->_outs[i];
-            out->_set_parent(instr);
-            out->ref(instr);
+            FnParamOutInstr *out = instr->_outs[i]->cast<FnParamOutInstr>();
+            FnParamOutInstr::_set_parent(out, instr);
         }
 
         return instr;

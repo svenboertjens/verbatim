@@ -14,6 +14,9 @@
 
 // Memory optimizations
 
+// NOTE: this pass is still unoptimized and will likely benefit from an approach that's less "brute force".
+// This version is to see if the underlying logic is correct, so that it can be reused for more complex approaches later on.
+
 
 namespace opt {
 
@@ -150,7 +153,6 @@ enum Enum {
 
     LOAD_OVERLAPS,
     STORE_OVERLAPS,
-    RMW_OVERLAPS, // From atomics who modify
 };
 };
 
@@ -571,6 +573,35 @@ static StoreInstr *pred_successor_has_store(StoreInstr *instr, Section *succ, Co
     return NULL;
 }
 
+// Returns the LoadInstr that matches, or NULL if we aliased the access or it wasn't present
+static LoadInstr *pred_successor_has_load(LoadInstr *instr, Section *succ, Context &ctx)
+{
+    Instr *access = succ->first_instr();
+
+    while (true)
+    {
+        bool matched_cmp;
+        access = walk_to_access(access, NULL, NULL, matched_cmp, true);
+
+        if (!access)
+            break;
+
+        if (access->kind() == InstrKind::LOAD)
+        {
+            LoadInstr *load = access->cast<LoadInstr>();
+            if (loads_equal(instr, load))
+                return load;
+        }
+
+        if (access_aliases_how(instr, instr->info_base(), instr->ptr(), access, ctx, AtomicAliasing::UP) != AliasesHow::NOT)
+            return NULL;
+
+        access = access->next();
+    }
+
+    return NULL;
+}
+
 // Expects an INSTR that we can freely place
 static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
 {
@@ -657,6 +688,9 @@ static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &al
 
     case CanHoistHow::MULTI_SUCCESSOR_PRED:
     {
+        // NOTE: unlike for loads, this path fails to catch duplicate stores when prior stores were already
+        // hoisted using this logic, and a new one lands on any of the succesors of our predecessor.
+
         Section *pred = relevant_preds[0];
         obj::Array<Section *> succs = pred->succeeding_sections();
 
@@ -672,7 +706,7 @@ static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &al
             if (succ == cur_sec)
                 continue;
 
-            StoreInstr *store = pred_successor_has_store(instr, succs[i], ctx);
+            StoreInstr *store = pred_successor_has_store(instr, succ, ctx);
 
             if (!store)
             {
@@ -686,12 +720,131 @@ static void store_walk(StoreInstr *instr, Instr *walk_start, SecAllowanceMap &al
         for (ObjSize i = 0; i < succs.size() - 1; i++)
             stores[i]->pop();
 
-        store_walk(instr, cur_sec->last_instr(), allowance, ctx);
+        store_walk(instr, pred->last_instr(), allowance, ctx);
         return;
     }
     }
 }
 
+
+// Try to forward MAIN using OTHER, or OTHER using MAIN.
+// Returns true on success, and replaces the redundant load.
+static always_inline bool load_try_forwarding(LoadInstr *main, Instr *other)
+{
+    MemInfoBase *mem;
+    bool other_is_immutable;
+    if (other->kind() == InstrKind::LOAD)
+    {
+        LoadInstr *load = other->cast<LoadInstr>();
+        mem = load->info_base();
+        other_is_immutable = load->is_volatile();
+    }
+    else
+    {
+        mem = other->cast<AtomicLoadInstr>()->info_base();
+        other_is_immutable = true;
+    }
+
+    // No need to optimize loads at different offsets; a shift introduces more latency than just keeping the load
+    if (main->offset() != mem->offset())
+        return false;
+
+    // If out types are equal, replacing is straightforward
+    if (main->out_type() == other->out_type())
+    {
+        main->replace_uses_with(other);
+        return true;
+    }
+
+    // Otherwise, only continue if we're working with integers; we can't truncate floats similarly.
+    if (Primitive::is_int(main->out_type()) && Primitive::is_int(other->out_type()))
+        return false;
+
+    // Check which to keep and which to replace depending on which is larger
+    Instr *keep, *replace;
+    if (Primitive::sizes[main->out_type()] < Primitive::sizes[other->out_type()])
+    {
+        keep = other;
+        replace = main;
+    }
+    else
+    {
+        // Can't replace the access if it's immutable 
+        if (other_is_immutable)
+            return false;
+
+        keep = main;
+        replace = other;
+    }
+
+    // Place INSTR so that both are in the right place, and we can use KEEP/REPLACE going further
+    other->place_next(main);
+
+    // Signedness set to false but is irrelevant; this operation shrinks, no sign extension can occur
+    TransformInstr *transform = TransformInstr::create(replace->out_type(), keep, false);
+
+    keep->place_next(transform);
+    replace->replace_uses_with(keep);
+
+    return true;
+}
+
+static always_inline bool store_try_forwarding(LoadInstr *main, Instr *other)
+{
+    MemInfoBase *mem;
+    Instr *store_value;
+    if (other->kind() == InstrKind::STORE)
+    {
+        StoreInstr *store = other->cast<StoreInstr>();
+        mem = store->info_base();
+        store_value = store->value();
+    }
+    else
+    {
+        AtomicStoreInstr *store = other->cast<AtomicStoreInstr>();
+        mem = store->info_base();
+        store_value = store->value();
+    }
+
+    // Check if our load fits within the store, rather than just overlapping
+    if (!access_sits_within(mem->offset(), main->offset(), Primitive::sizes[other->out_type()], Primitive::sizes[main->out_type()]))
+        return false;
+
+    Instr *forward_value = store_value;
+
+    // Check if we need to shift the store value.
+    // We can only do this for integers, not for floats.
+    if (main->offset() != mem->offset())
+    {
+        if (Primitive::is_fp(main->out_type()))
+            return false;
+
+        u32 shift_value = (main->offset() - mem->offset()) * 8;
+        ImmediateInstr *shift_imm = ImmediateInstr::create(Primitive::i32, shift_value);
+        IntInstr *shifted_value = IntInstr::create(other->out_type(), forward_value, shift_imm, IntOp::SHR, IntOp::NOFLAGS);
+
+        forward_value->place_next(shift_imm);
+        shift_imm->place_next(shifted_value);
+        forward_value = shifted_value;
+    }
+
+    // Check if we need to transform the value to a smaller size.
+    // Again, we can only do this for integers, not for floats.
+    if (main->out_type() != other->out_type())
+    {
+        if (Primitive::is_fp(main->out_type()))
+            return false;
+        
+        // Signedness set to false but irrelevant
+        TransformInstr *transformed = TransformInstr::create(main->out_type(), forward_value, false);
+        
+        forward_value->place_next(transformed);
+        forward_value = transformed;
+    }
+
+    main->replace_uses_with(forward_value);
+    return true;
+}
 
 // Expects an INSTR that we can freely place
 static void load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allowance, Context &ctx)
@@ -724,120 +877,51 @@ static void load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allo
 
         if (aliashow == AliasesHow::LOAD_OVERLAPS)
         {
-            // Only forward if both are either an integer or a float
-            if (Primitive::is_int(instr->out_type()) == Primitive::is_int(access->out_type()))
-                continue;
-
-            MemInfoBase *mem;
-            bool access_is_immutable;
-            if (access->kind() == InstrKind::LOAD)
-            {
-                LoadInstr *load = access->cast<LoadInstr>();
-                mem = load->info_base();
-                access_is_immutable = load->is_volatile();
-            }
-            else
-            {
-                mem = access->cast<AtomicLoadInstr>()->info_base();
-                access_is_immutable = true;
-            }
-
-            // No need to optimize loads at different offsets; a shift introduces more latency than just keeping the load
-            if (instr->offset() != mem->offset())
-                continue;
-
-            // If out types are equal, replacing is straightforward
-            if (instr->out_type() == access->out_type())
-            {
-                instr->replace_uses_with(access);
+            if (load_try_forwarding(instr, access))
                 return;
-            }
 
-            // Check which to keep and which to replace depending on which is larger
-            Instr *keep, *replace;
-            if (Primitive::sizes[instr->out_type()] < Primitive::sizes[access->out_type()])
-            {
-                keep = access;
-                replace = instr;
-            }
-            else
-            {
-                // Can't replace the access if it's immutable 
-                if (access_is_immutable)
-                    continue;
-
-                keep = instr;
-                replace = access;
-            }
-
-            // Place INSTR so that both are in the right place, and we can use KEEP/REPLACE going further
-            access->place_next(instr);
-
-            // Signedness set to false but is irrelevant; this operation shrinks, no sign extension can occur
-            TransformInstr *transform = TransformInstr::create(replace->out_type(), keep, false);
-
-            keep->place_next(transform);
-            replace->replace_uses_with(keep);
-
-            return;
+            continue;
         }
 
-        // TODO: allow store-to-load forwarding for atomic stores that returned ATOMIC_ORDER instead of STORE_OVERLAPS
         if (aliashow == AliasesHow::STORE_OVERLAPS)
         {
-            // Only forward if both are either an integer or a float
-            if (Primitive::is_int(instr->out_type()) == Primitive::is_int(access->out_type()))
-                continue;
+            if (store_try_forwarding(instr, access))
+                return;
 
-            MemInfoBase *mem;
-            Instr *store_value;
-            if (access->kind() == InstrKind::STORE)
+            continue;
+        }
+
+        // For atomic loads/stores that blocked us due to ordering, check if we can still forward them.
+        // If these fail, we mustn't continue, but instead delegate to the boundary path.
+        if (aliashow == AliasesHow::ATOMIC_ORDER)
+        {
+            // Rather than doing overlap checks, we do the sits-within check,
+            // as our access can't be the one getting replaced.
+
+            if (access->kind() == InstrKind::ATOMIC_LOAD)
             {
-                StoreInstr *store = access->cast<StoreInstr>();
-                mem = store->info_base();
-                store_value = store->value();
+                AtomicLoadInstr *load = access->cast<AtomicLoadInstr>();
+
+                if (
+                    instr->ptr() == load->ptr() &&
+                    access_sits_within(load->offset(), instr->offset(), Primitive::sizes[load->out_type()], Primitive::sizes[instr->out_type()])
+                ) {
+                    if (load_try_forwarding(instr, access))
+                        return;
+                }
             }
-            else
+            else if (access->kind() == InstrKind::ATOMIC_STORE)
             {
                 AtomicStoreInstr *store = access->cast<AtomicStoreInstr>();
-                mem = store->info_base();
-                store_value = store->value();
+
+                if (
+                    instr->ptr() == store->ptr() &&
+                    access_sits_within(store->offset(), instr->offset(), Primitive::sizes[store->out_type()], Primitive::sizes[instr->out_type()])
+                ) {
+                    if (store_try_forwarding(instr, access))
+                        return;
+                }
             }
-
-            // Check if our load fits within the store, rather than just overlapping
-            if (!access_sits_within(mem->offset(), instr->offset(), Primitive::sizes[access->out_type()], Primitive::sizes[instr->out_type()]))
-                continue;
-
-            Instr *forward_value = store_value;
-
-            // Check if we need to shift the store value.
-            // We can only do this for integers, not for floats.
-            if (instr->offset() != mem->offset())
-            {
-                if (Primitive::is_fp(instr->out_type()))
-                    continue;
-
-                u32 shift_value = (instr->offset() - mem->offset()) * 8;
-                ImmediateInstr *shift_imm = ImmediateInstr::create(Primitive::i32, shift_value);
-                IntInstr *shifted_value = IntInstr::create(access->out_type(), forward_value, shift_imm, IntOp::SHR, IntOp::NOFLAGS);
-
-                forward_value->place_next(shift_imm);
-                shift_imm->place_next(shifted_value);
-                forward_value = shifted_value;
-            }
-
-            // Check if we need to transform the value to a smaller size
-            if (instr->out_type() != access->out_type())
-            {
-                // Signedness set to false but irrelevant
-                TransformInstr *transformed = TransformInstr::create(instr->out_type(), forward_value, false);
-                
-                forward_value->place_next(transformed);
-                forward_value = transformed;
-            }
-
-            instr->replace_uses_with(forward_value);
-            return;
         }
 
         access->place_next(instr);
@@ -867,12 +951,63 @@ static void load_walk(LoadInstr *instr, Instr *walk_start, SecAllowanceMap &allo
 
     case CanHoistHow::MULTI_PRED_HOIST:
     {
-        // TODO
+        JunctionInstr *junct = cur_sec->first_instr()->cast<JunctionInstr>();
+        JunctOutInstr *out = junct->add_out(instr->out_type());
+
+        const obj::Array<Section *> preds = last->section()->preceding_sections();
+
+        // Per predecessor, place a new load as input for the OutInstr we just created,
+        // and walk it down the predecessor.
+        for (ObjSize i = 0; i < preds.size(); i++)
+        {
+            Section *pred = preds[i];
+            LoadInstr *load = duplicate_load(instr);
+
+            JumpInstr *jump = pred->last_instr()->cast<JumpInstr>();
+            jump->add_value(load);
+
+            load_walk(load, jump, allowance, ctx);
+        }
+
+        // Replace our load with the OutInstr, because the OutInstr is the result of
+        // the load but executed in predecessors.
+        instr->replace_uses_with(out);
+        return;
     }
 
     case CanHoistHow::MULTI_SUCCESSOR_PRED:
     {
-        // TODO
+        Section *pred = relevant_preds[0];
+        obj::Array<Section *> succs = pred->succeeding_sections();
+
+        // The loads to deduplicate
+        LoadInstr *loads[succs.size() - 1];
+
+        // Check if all predecessors also do this exact load in a non-aliasing manner
+        ObjSize loads_iter = 0;
+        for (ObjSize i = 0; i < succs.size(); i++)
+        {
+            Section *succ = succs[i];
+
+            if (succ == cur_sec)
+                continue;
+
+            LoadInstr *load = pred_successor_has_load(instr, succ, ctx);
+
+            if (!load)
+            {
+                last->place_next(instr);
+                return;
+            }
+
+            loads[loads_iter++] = load;
+        }
+
+        for (ObjSize i = 0; i < succs.size() - 1; i++)
+            loads[i]->pop();
+
+        load_walk(instr, pred->last_instr(), allowance, ctx);
+        return;
     }
     }
 }
